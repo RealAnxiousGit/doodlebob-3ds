@@ -402,6 +402,46 @@ static inline bool Collision_instancesOverlapPrecise(DataWin* dataWin, bool comp
         sampleOffset = 0.5;
     }
 
+    // Fast path (3DS port): neither instance rotated. Collision_pointInInstance's per-pixel maths then splits into a
+    // column part and a row part, so compute each once with the same expressions and scan with integer mask lookups.
+    int32_t lastX = compatMode ? endX : endX - 1;
+    int32_t lastY = compatMode ? endY : endY - 1;
+    int32_t spanW = lastX - startX + 1;
+    if (spanW > 0 && 1024 >= spanW && lastY >= startY &&
+        GMLReal_fabs(a->imageAngle) <= 0.0001 && GMLReal_fabs(b->imageAngle) <= 0.0001 &&
+        GMLReal_fabs(a->imageXscale) >= 0.0001 && GMLReal_fabs(a->imageYscale) >= 0.0001 &&
+        GMLReal_fabs(b->imageXscale) >= 0.0001 && GMLReal_fabs(b->imageYscale) >= 0.0001) {
+        int16_t colA[1024], colB[1024];
+        repeat(spanW, c) {
+            GMLReal wpx = (GMLReal) (startX + (int32_t) c) + sampleOffset;
+            GMLReal lxA = (wpx - a->x) / a->imageXscale + (GMLReal) sprA->originX;
+            GMLReal lxB = (wpx - b->x) / b->imageXscale + (GMLReal) sprB->originX;
+            int32_t ixA = (int32_t) lxA, ixB = (int32_t) lxB;
+            colA[c] = (0 > ixA || ixA >= (int32_t) sprA->width) ? -1 : (int16_t) ixA;
+            colB[c] = (0 > ixB || ixB >= (int32_t) sprB->width) ? -1 : (int16_t) ixB;
+        }
+        bool maskedA = Collision_hasFrameMasks(sprA), maskedB = Collision_hasFrameMasks(sprB);
+        const uint8_t* maskA = maskedA ? sprA->masks[((uint32_t) a->imageIndex) % sprA->maskCount] : nullptr;
+        const uint8_t* maskB = maskedB ? sprB->masks[((uint32_t) b->imageIndex) % sprB->maskCount] : nullptr;
+        uint32_t rowBytesA = (sprA->width + 7) / 8, rowBytesB = (sprB->width + 7) / 8;
+        for (int32_t py = startY; lastY >= py; py++) {
+            GMLReal wpy = (GMLReal) py + sampleOffset;
+            int32_t iyA = (int32_t) ((wpy - a->y) / a->imageYscale + (GMLReal) sprA->originY);
+            int32_t iyB = (int32_t) ((wpy - b->y) / b->imageYscale + (GMLReal) sprB->originY);
+            if (0 > iyA || iyA >= (int32_t) sprA->height || 0 > iyB || iyB >= (int32_t) sprB->height) continue;
+            const uint8_t* rowA = maskedA ? maskA + (uint32_t) iyA * rowBytesA : nullptr;
+            const uint8_t* rowB = maskedB ? maskB + (uint32_t) iyB * rowBytesB : nullptr;
+            repeat(spanW, c) {
+                int32_t ixA = colA[c], ixB = colB[c];
+                if (0 > ixA || 0 > ixB) continue;
+                if (rowA != nullptr && (rowA[ixA >> 3] & (1 << (7 - (ixA & 7)))) == 0) continue;
+                if (rowB != nullptr && (rowB[ixB >> 3] & (1 << (7 - (ixB & 7)))) == 0) continue;
+                return true;
+            }
+        }
+        return false;
+    }
+
     for (int32_t py = startY; (compatMode ? py <= endY : py < endY); py++) {
         for (int32_t px = startX; (compatMode ? px <= endX : px < endX); px++) {
             GMLReal wpx = (GMLReal) px + sampleOffset;

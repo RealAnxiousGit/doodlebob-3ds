@@ -170,6 +170,13 @@ static void Runner_prepare3DSDrawBattleState(Runner* runner) {
 
     runner->n3dsDrawHasTopEnemyDialogue = false;
     runner->n3dsDrawAsrielBattle = false;
+    if (!runner->n3dsUndertaleHacks) {
+        // Not Undertale: never enter battle layouts, and skip the per-frame instance scan.
+        runner->n3dsDrawBattleActive = false;
+        runner->n3dsDrawDodgingBullets = false;
+        runner->n3dsDrawBattleStateValid = true;
+        return;
+    }
     bool hasLiveBattleBorder = false;
     bool hasActiveBattleController = false;
     if (runner->instances != NULL) {
@@ -1109,7 +1116,7 @@ void Runner_scrollBackgrounds(Runner* runner) {
 }
 
 void Runner_drawBackgrounds(Runner* runner, bool foreground) {
-    if (runner->renderer == nullptr) return;
+    if (runner->renderer == nullptr || runner->drawPassNoBackgrounds) return;
     double startMs = Runner_nowMs();
     DataWin* dataWin = runner->dataWin;
     float roomW = (float) runner->currentRoom->width;
@@ -1204,6 +1211,7 @@ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawabl
         Instance* inst = d->instance;
         if (!inst->active || !inst->visible)
             continue;
+        if (!Runner_drawPassAllows(runner, inst)) continue;
 #ifdef __3DS__
         if ((subtype == DRAW_GUI_BEGIN || subtype == DRAW_GUI || subtype == DRAW_GUI_END) &&
             Runner_shouldHideOn3DSTopScreen(runner, inst)) {
@@ -1765,7 +1773,7 @@ void Runner_draw(Runner* runner) {
     repeat(drawableCount, i) {
         Drawable* d = &drawables[i];
         if (d->type == DRAWABLE_TILE) {
-            if (runner->renderer != nullptr) {
+            if (runner->renderer != nullptr && !runner->drawPassNoTiles) {
                 double drawStartMs = Runner_nowMs();
                 RoomTile* tile = &room->tiles[d->tileIndex];
                 // Skip tiles whose layer was hidden via tile_layer_hide(). Filtered here (not in the cache) so toggling layer visibility doesn't invalidate.
@@ -1813,6 +1821,7 @@ void Runner_draw(Runner* runner) {
             Instance* inst = d->instance;
             // Filter inactive/invisible instances at draw time so the cache doesn't need invalidation when those flags toggle.
             if (!inst->active || !inst->visible) continue;
+            if (!Runner_drawPassAllows(runner, inst)) continue;
 #ifdef __3DS__
             if (n3dsBattleActiveForDraw) {
                 if (n3dsTopScreenDrawInstanceCursor >= n3dsTopScreenDrawInstanceCount ||
@@ -2832,6 +2841,12 @@ Runner* Runner_create(DataWin* dataWin, VMContext* vm, Renderer* renderer, FileS
     runner->frameCount = 0;
     runner->osType = OS_WINDOWS;
     runner->keyboard = RunnerKeyboard_create();
+    runner->mouse = RunnerMouse_create();
+    {
+        // Undertale-only 3DS hacks are keyed off the game's display name.
+        const char* displayName = dataWin->gen8.displayName;
+        runner->n3dsUndertaleHacks = displayName != nullptr && strstr(displayName, "UNDERTALE") != nullptr;
+    }
     runner->gamepads = RunnerGamepad_create();
     runner->frameStepTopObjectIndex = -1;
     if (dataWin->objt.count > 0) {
@@ -3271,6 +3286,141 @@ static bool adaptPath(Runner* runner, Instance* inst) {
     return atPathEnd;
 }
 
+// ===[ Mouse ]=== (dispatch backported from upstream main; position mapping simplified for unrotated views)
+
+void Runner_getMouseRoomPosition(Runner* runner, GMLReal* outX, GMLReal* outY) {
+    GMLReal sx = (GMLReal) runner->mouse->screenX;
+    GMLReal sy = (GMLReal) runner->mouse->screenY;
+    *outX = sx;
+    *outY = sy;
+    if (runner->currentRoom == nullptr || (runner->currentRoom->flags & 1) == 0) return;
+
+    RuntimeView* picked = nullptr;
+    RuntimeView* lastEnabled = nullptr;
+    repeat(MAX_VIEWS, vi) {
+        RuntimeView* v = &runner->views[vi];
+        if (!v->enabled) continue;
+        lastEnabled = v;
+        if (sx >= v->portX && sx < v->portX + v->portWidth && sy >= v->portY && sy < v->portY + v->portHeight) {
+            picked = v;
+            break;
+        }
+    }
+    if (picked == nullptr) picked = lastEnabled;
+    if (picked == nullptr || picked->portWidth <= 0 || picked->portHeight <= 0) return;
+
+    *outX = (GMLReal) picked->viewX + (sx - (GMLReal) picked->portX) * (GMLReal) picked->viewWidth / (GMLReal) picked->portWidth;
+    *outY = (GMLReal) picked->viewY + (sy - (GMLReal) picked->portY) * (GMLReal) picked->viewHeight / (GMLReal) picked->portHeight;
+}
+
+// Fires one local mouse subtype event on every instance in a snapshot that currently has the mouse over it.
+static void fireLocalMouseSubtype(Runner* runner, int32_t subtype, int32_t slot, Instance** snapshot, int32_t count, bool* isOverArr) {
+    if (slot < 0) return;
+    ResolvedEventTable* table = &runner->eventTable;
+    repeat(count, i) {
+        Instance* inst = snapshot[i];
+        if (!inst->active) continue;
+        if (!isOverArr[i]) continue;
+        int32_t ownerObjectIndex = -1;
+        int32_t codeId = ResolvedEventTable_lookup(table, inst->objectIndex, slot, &ownerObjectIndex);
+        if (0 > codeId) continue;
+        Runner_executeResolvedEvent(runner, inst, EVENT_MOUSE, subtype, codeId, ownerObjectIndex);
+        if (runner->pendingRoom >= 0) return;
+    }
+}
+
+static void dispatchMouseEvents(Runner* runner) {
+    RunnerMouseState* mouse = runner->mouse;
+    DataWin* dataWin = runner->dataWin;
+
+    GMLReal mx, my;
+    Runner_getMouseRoomPosition(runner, &mx, &my);
+
+    // Global events
+    if (RunnerMouse_checkButton(mouse, GML_MB_LEFT)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_LEFT_BUTTON);
+    if (RunnerMouse_checkButton(mouse, GML_MB_RIGHT)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_RIGHT_BUTTON);
+    if (RunnerMouse_checkButton(mouse, GML_MB_MIDDLE)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_MIDDLE_BUTTON);
+    if (RunnerMouse_checkButtonPressed(mouse, GML_MB_LEFT)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_LEFT_PRESSED);
+    if (RunnerMouse_checkButtonPressed(mouse, GML_MB_RIGHT)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_RIGHT_PRESSED);
+    if (RunnerMouse_checkButtonPressed(mouse, GML_MB_MIDDLE)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_MIDDLE_PRESSED);
+    if (RunnerMouse_checkButtonReleased(mouse, GML_MB_LEFT)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_LEFT_RELEASED);
+    if (RunnerMouse_checkButtonReleased(mouse, GML_MB_RIGHT)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_RIGHT_RELEASED);
+    if (RunnerMouse_checkButtonReleased(mouse, GML_MB_MIDDLE)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_GLOB_MIDDLE_RELEASED);
+    if (RunnerMouse_getWheelUp(mouse)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_WHEEL_UP);
+    if (RunnerMouse_getWheelDown(mouse)) Runner_executeEventForAll(runner, EVENT_MOUSE, MOUSE_WHEEL_DOWN);
+    if (runner->pendingRoom >= 0) return;
+
+    // Local events: only on instances whose mask is under the cursor
+    int32_t slotLeftBtn     = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_LEFT_BUTTON);
+    int32_t slotRightBtn    = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_RIGHT_BUTTON);
+    int32_t slotMiddleBtn   = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_MIDDLE_BUTTON);
+    int32_t slotNoBtn       = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_NO_BUTTON);
+    int32_t slotLeftPress   = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_LEFT_PRESSED);
+    int32_t slotRightPress  = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_RIGHT_PRESSED);
+    int32_t slotMiddlePress = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_MIDDLE_PRESSED);
+    int32_t slotLeftRel     = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_LEFT_RELEASED);
+    int32_t slotRightRel    = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_RIGHT_RELEASED);
+    int32_t slotMiddleRel   = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_MIDDLE_RELEASED);
+    int32_t slotEnter       = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_ENTER);
+    int32_t slotLeave       = EventSlotMap_lookup(&runner->eventSlotMap, EVENT_MOUSE, MOUSE_LEAVE);
+    bool anyLocalSlot = slotLeftBtn >= 0 || slotRightBtn >= 0 || slotMiddleBtn >= 0 || slotNoBtn >= 0 ||
+                        slotLeftPress >= 0 || slotRightPress >= 0 || slotMiddlePress >= 0 ||
+                        slotLeftRel >= 0 || slotRightRel >= 0 || slotMiddleRel >= 0 || slotEnter >= 0 || slotLeave >= 0;
+    if (!anyLocalSlot) return;
+
+    int32_t instCount = (int32_t) arrlen(runner->instances);
+    if (instCount == 0) return;
+    int32_t snapshotBase = (int32_t) arrlen(runner->instanceSnapshots);
+    arrsetlen(runner->instanceSnapshots, snapshotBase + instCount);
+    memcpy(&runner->instanceSnapshots[snapshotBase], runner->instances, (size_t) instCount * sizeof(Instance*));
+    bool* isOver = (bool*) safeMalloc((size_t) instCount * sizeof(bool));
+
+    ResolvedEventTable* table = &runner->eventTable;
+    repeat(instCount, i) {
+        Instance* inst = runner->instanceSnapshots[snapshotBase + i];
+        if (!inst->active) { isOver[i] = false; continue; }
+        Sprite* spr = Collision_getSprite(dataWin, inst);
+        bool over = spr != nullptr && Collision_pointInInstance(spr, inst, mx, my);
+        isOver[i] = over;
+        bool wasOver = inst->mouseOver;
+        inst->mouseOver = over;
+        int32_t edgeSlot = (over && !wasOver) ? slotEnter : ((!over && wasOver) ? slotLeave : -1);
+        if (edgeSlot >= 0) {
+            int32_t ownerObjectIndex = -1;
+            int32_t codeId = ResolvedEventTable_lookup(table, inst->objectIndex, edgeSlot, &ownerObjectIndex);
+            if (codeId >= 0) {
+                Runner_executeResolvedEvent(runner, inst, EVENT_MOUSE, over ? MOUSE_ENTER : MOUSE_LEAVE, codeId, ownerObjectIndex);
+                if (runner->pendingRoom >= 0) goto done;
+            }
+        }
+    }
+
+    Instance** snap = &runner->instanceSnapshots[snapshotBase];
+    if (RunnerMouse_checkButton(mouse, GML_MB_LEFT)) fireLocalMouseSubtype(runner, MOUSE_LEFT_BUTTON, slotLeftBtn, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (RunnerMouse_checkButton(mouse, GML_MB_RIGHT)) fireLocalMouseSubtype(runner, MOUSE_RIGHT_BUTTON, slotRightBtn, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (RunnerMouse_checkButton(mouse, GML_MB_MIDDLE)) fireLocalMouseSubtype(runner, MOUSE_MIDDLE_BUTTON, slotMiddleBtn, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (!RunnerMouse_checkButton(mouse, GML_MB_ANY)) fireLocalMouseSubtype(runner, MOUSE_NO_BUTTON, slotNoBtn, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (RunnerMouse_checkButtonPressed(mouse, GML_MB_LEFT)) fireLocalMouseSubtype(runner, MOUSE_LEFT_PRESSED, slotLeftPress, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (RunnerMouse_checkButtonPressed(mouse, GML_MB_RIGHT)) fireLocalMouseSubtype(runner, MOUSE_RIGHT_PRESSED, slotRightPress, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (RunnerMouse_checkButtonPressed(mouse, GML_MB_MIDDLE)) fireLocalMouseSubtype(runner, MOUSE_MIDDLE_PRESSED, slotMiddlePress, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (RunnerMouse_checkButtonReleased(mouse, GML_MB_LEFT)) fireLocalMouseSubtype(runner, MOUSE_LEFT_RELEASED, slotLeftRel, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (RunnerMouse_checkButtonReleased(mouse, GML_MB_RIGHT)) fireLocalMouseSubtype(runner, MOUSE_RIGHT_RELEASED, slotRightRel, snap, instCount, isOver);
+    if (runner->pendingRoom >= 0) goto done;
+    if (RunnerMouse_checkButtonReleased(mouse, GML_MB_MIDDLE)) fireLocalMouseSubtype(runner, MOUSE_MIDDLE_RELEASED, slotMiddleRel, snap, instCount, isOver);
+
+done:
+    arrsetlen(runner->instanceSnapshots, snapshotBase);
+    free(isOver);
+}
+
 static void dispatchCollisionEvents(Runner* runner) {
     DataWin* dataWin = runner->dataWin;
     // Iterate only the objects that have any collision event in their parent chain.
@@ -3362,6 +3512,7 @@ static void dispatchCollisionEvents(Runner* runner) {
                     if (hadSolid && self->active && other->active) {
                         adaptPath(runner, self);
                         adaptPath(runner, other);
+                        float selfX = self->x, selfY = self->y, otherX = other->x, otherY = other->y;
                         if (self->hspeed != 0.0f || self->vspeed != 0.0f) {
                             self->x += self->hspeed;
                             self->y += self->vspeed;
@@ -3371,6 +3522,23 @@ static void dispatchCollisionEvents(Runner* runner) {
                             other->x += other->hspeed;
                             other->y += other->vspeed;
                             SpatialGrid_markInstanceAsDirty(runner->spatialGrid, other);
+                        }
+                        // GameMaker re-tests after this move: if the pair still collides, the move is undone.
+                        // Without it, an instance falling past the side of a solid gets pushed into it every step.
+                        if (self->x != selfX || self->y != selfY || other->x != otherX || other->y != otherY) {
+                            InstanceBBox boxA = Collision_computeBBox(dataWin, self);
+                            InstanceBBox boxB = Collision_computeBBox(dataWin, other);
+                            bool overlap = boxA.valid && boxB.valid &&
+                                !(boxA.left >= boxB.right || boxB.left >= boxA.right || boxA.top >= boxB.bottom || boxB.top >= boxA.bottom) &&
+                                Collision_instancesOverlapPrecise(dataWin, runner->collisionCompatibilityMode, self, other, boxA, boxB);
+                            if (overlap) {
+                                self->x = selfX;
+                                self->y = selfY;
+                                other->x = otherX;
+                                other->y = otherY;
+                                SpatialGrid_markInstanceAsDirty(runner->spatialGrid, self);
+                                SpatialGrid_markInstanceAsDirty(runner->spatialGrid, other);
+                            }
                         }
                     }
 
@@ -3728,6 +3896,9 @@ void Runner_step(Runner* runner) {
             arrsetlen(runner->instanceSnapshots, snapshotBase);
         }
     }
+
+    // Mouse events fire after keyboard/alarms and before the normal step (GameMaker's event order)
+    if (runner->pendingRoom < 0) dispatchMouseEvents(runner);
 
     // Execute Normal Step for all instances
     Runner_executeEventForAll(runner, EVENT_STEP, STEP_NORMAL);
@@ -4281,6 +4452,7 @@ void Runner_free(Runner* runner) {
     shfree(runner->assetsByName);
 
     RunnerKeyboard_free(runner->keyboard);
+    RunnerMouse_free(runner->mouse);
     RunnerGamepad_free(runner->gamepads);
     Instance_free(runner->globalScopeInstance);
     free(runner);

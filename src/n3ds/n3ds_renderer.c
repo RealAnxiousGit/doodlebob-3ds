@@ -39,16 +39,23 @@
 #define N3DS_DIRECT_ASSET_ENTRY_SIZE 16u
 #define N3DS_TOP_WIDTH 400
 #define N3DS_TOP_HEIGHT 240
+// Mirror mode: power-of-two texture holding one top-screen frame, shown at 80% on the 320x240 touchscreen.
+#define N3DS_MIRROR_TEX_W 512
+#define N3DS_MIRROR_TEX_H 256
+#define N3DS_MIRROR_BOTTOM_SCALE 0.8f
+#define N3DS_MIRROR_BOTTOM_Y 24.0f
 #define N3DS_BOTTOM_WIDTH 320
 #define N3DS_BOTTOM_HEIGHT 240
-#define N3DS_SDMC_ASSET_BASE "sdmc:/3ds/cinnamon/gfx"
+#define N3DS_SDMC_ASSET_BASE "sdmc:/3ds/DoodleBob/gfx"
 #define N3DS_ROMFS_ASSET_BASE "romfs:/gfx"
 #define N3DS_RENDERER_FILE_BUFFER_SIZE (32u * 1024u)
 #define N3DS_TILE_LAYER_CHUNK_SIZE 256u
 #define N3DS_TILE_LAYER_CHUNK_TEXTURE_BYTES (N3DS_TILE_LAYER_CHUNK_SIZE * N3DS_TILE_LAYER_CHUNK_SIZE * 2u)
 #define N3DS_TILE_LAYER_CHUNK_VRAM_BUDGET (512u * 1024u)
 #define N3DS_MAX_RESIDENT_ATLAS_PAGES_OLD3DS 16u
-#define N3DS_MAX_RESIDENT_ATLAS_PAGES_NEW3DS 32u
+// DoodleBob: 48 on New 3DS. Two-screen frames (playfield below, scenery and HUD above) need more than 32 pages in
+// boss fights, which re-imported (and LZ11-unpacked) ~12 pages every frame. Pages live in linear memory, ~24 MB free.
+#define N3DS_MAX_RESIDENT_ATLAS_PAGES_NEW3DS 48u
 #define N3DS_MAX_RESIDENT_ATLAS_PAGES_OLD3DS_ETC1A4 40u
 #define N3DS_MAX_RESIDENT_ATLAS_PAGES_NEW3DS_ETC1A4 80u
 #define N3DS_PREWARM_GPU_PAGE_BUDGET_OLD3DS 12u
@@ -58,7 +65,7 @@
 #define N3DS_PREWARM_BLOB_BYTES_OLD3DS (8u * 1024u * 1024u)
 #define N3DS_PREWARM_BLOB_BYTES_NEW3DS (12u * 1024u * 1024u)
 #define N3DS_RESIDENT_ATLAS_VRAM_BUDGET_OLD3DS (2560u * 1024u)
-#define N3DS_RESIDENT_ATLAS_VRAM_BUDGET_NEW3DS (5120u * 1024u)
+#define N3DS_RESIDENT_ATLAS_VRAM_BUDGET_NEW3DS (7168u * 1024u)
 #define N3DS_MAX_CACHED_T3X_BYTES_OLD3DS (16u * 1024u * 1024u)
 #define N3DS_MAX_CACHED_T3X_BYTES_NEW3DS (24u * 1024u * 1024u)
 #define N3DS_MAX_CACHED_DIRECT_T3X_BYTES_OLD3DS (4u * 1024u * 1024u)
@@ -70,7 +77,7 @@
 #define N3DS_TOP_BATTLE_ENEMY_Y_OFFSET 200.0f
 #define N3DS_C2D_FLUSH_DRAW_BUDGET 192u
 #define N3DS_PERF_LOG_INTERVAL_FRAMES 30u
-#define N3DS_ATLAS_TRACE_LOG_PATH "sdmc:/3ds/cinnamon/atlas_trace.log"
+#define N3DS_ATLAS_TRACE_LOG_PATH "sdmc:/3ds/DoodleBob/atlas_trace.log"
 
 typedef struct {
     uint16_t width;
@@ -271,6 +278,20 @@ typedef struct {
     Renderer base;
     C3D_RenderTarget* topTarget;
     C3D_RenderTarget* bottomTarget;
+    // Mirror mode (DoodleBob): the game frame is drawn once into mirrorTex (top-screen layout),
+    // then shown 1:1 on the top screen and scaled down on the touchscreen so the stylus can draw on it.
+    bool mirrorEnabled;
+    C3D_Tex mirrorTex;
+    C3D_RenderTarget* mirrorTarget;
+    Tex3DS_SubTexture mirrorSubtex;
+    C2D_Image mirrorImage;
+    int32_t lastGameW;
+    int32_t lastGameH;
+    // Split frames: each pass draws straight to one screen with its own scale/offset (game-window px -> screen px).
+    // Without a split, the mirror texture is shown whole on top and through the bottom mapping on the touchscreen.
+    bool splitFrame;
+    uint8_t passTarget;
+    float bottomScale, bottomOffsetX, bottomOffsetY;
     N3DSLoadedAtlasPage* atlasPages;
     N3DSAtlasItem* atlasItems;
     N3DSAtlasItemV3* atlasItemsV3;
@@ -744,7 +765,8 @@ static void N3DSRenderer_getActiveTargetSize(const N3DSRenderer* renderer, float
 
     bool useBottomTarget =
         renderer != NULL &&
-        (renderer->activeSceneTarget == N3DS_SCENE_TARGET_BOTTOM || renderer->bottomScreenGuiActive);
+        (renderer->activeSceneTarget == N3DS_SCENE_TARGET_BOTTOM || renderer->bottomScreenGuiActive ||
+         (renderer->splitFrame && renderer->passTarget == N3DS_SCENE_TARGET_BOTTOM));
     *outW = useBottomTarget ? (float) N3DS_BOTTOM_WIDTH : (float) N3DS_TOP_WIDTH;
     *outH = useBottomTarget ? (float) N3DS_BOTTOM_HEIGHT : (float) N3DS_TOP_HEIGHT;
 }
@@ -1852,8 +1874,13 @@ static void N3DSRenderer_sceneBeginTarget(N3DSRenderer* renderer, uint8_t target
     N3DSRenderer_flushC2DQueue(renderer);
 
     if (targetKind == N3DS_SCENE_TARGET_TOP) {
-        if (renderer->topTarget == NULL) return;
-        C2D_SceneBegin(renderer->topTarget);
+        // In mirror mode, "top" drawing goes to the offscreen game texture; endFrame presents it.
+        C3D_RenderTarget* target = renderer->mirrorEnabled ? renderer->mirrorTarget : renderer->topTarget;
+        if (renderer->splitFrame) {
+            target = renderer->passTarget == N3DS_SCENE_TARGET_BOTTOM ? renderer->bottomTarget : renderer->topTarget;
+        }
+        if (target == NULL) return;
+        C2D_SceneBegin(target);
         renderer->activeSceneTarget = N3DS_SCENE_TARGET_TOP;
         return;
     }
@@ -2481,7 +2508,7 @@ static bool N3DSRenderer_loadAtlas(N3DSRenderer* renderer) {
     FILE* atlasFile = N3DSRenderer_openAssetFile(renderer, "atlas.bin", assetPath, sizeof(assetPath));
     if (atlasFile == NULL) {
         N3DSRenderer_setStartupError(renderer, "Missing gfx/atlas.bin on SD or ROMFS");
-        fprintf(stderr, "N3DS: missing atlas.bin in sdmc:/3ds/cinnamon/gfx or romfs:/gfx\n");
+        fprintf(stderr, "N3DS: missing atlas.bin in sdmc:/3ds/DoodleBob/gfx or romfs:/gfx\n");
         return false;
     }
     fprintf(stderr, "N3DS: loading atlas from %s\n", assetPath);
@@ -3278,6 +3305,24 @@ static void N3DSRenderer_init(Renderer* base, DataWin* dataWin) {
     renderer->topTarget = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
 #ifndef N3DS_DISABLE_BOTTOM_SCREEN
     renderer->bottomTarget = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+    if (renderer->bottomTarget != NULL && C3D_TexInitVRAM(&renderer->mirrorTex, N3DS_MIRROR_TEX_W, N3DS_MIRROR_TEX_H, GPU_RGBA8)) {
+        renderer->mirrorTarget = C3D_RenderTargetCreateFromTex(&renderer->mirrorTex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH16);
+        if (renderer->mirrorTarget != NULL) {
+            C3D_TexSetFilter(&renderer->mirrorTex, GPU_LINEAR, GPU_LINEAR);
+            renderer->mirrorSubtex = (Tex3DS_SubTexture) {
+                .width = N3DS_TOP_WIDTH,
+                .height = N3DS_TOP_HEIGHT,
+                .left = 0.0f,
+                .top = 1.0f,
+                .right = (float) N3DS_TOP_WIDTH / (float) N3DS_MIRROR_TEX_W,
+                .bottom = 1.0f - ((float) N3DS_TOP_HEIGHT / (float) N3DS_MIRROR_TEX_H),
+            };
+            renderer->mirrorImage = (C2D_Image) { .tex = &renderer->mirrorTex, .subtex = &renderer->mirrorSubtex };
+            renderer->mirrorEnabled = true;
+        } else {
+            C3D_TexDelete(&renderer->mirrorTex);
+        }
+    }
 #endif
     renderer->blendEnabled = true;
     renderer->blendEquation = bm_normal;
@@ -3388,6 +3433,10 @@ static void N3DSRenderer_destroy(Renderer* base) {
         arrfree(renderer->tileLayerChunkCaches);
         renderer->tileLayerChunkCaches = NULL;
     }
+    if (renderer->mirrorTarget != NULL) {
+        C3D_RenderTargetDelete(renderer->mirrorTarget);
+        C3D_TexDelete(&renderer->mirrorTex);
+    }
     if (renderer->bottomTarget != NULL) {
         C3D_RenderTargetDelete(renderer->bottomTarget);
     }
@@ -3403,6 +3452,8 @@ static void N3DSRenderer_beginFrame(Renderer* base, int32_t gameW, int32_t gameH
     renderer->activeSceneTarget = N3DS_SCENE_TARGET_NONE;
     N3DSRenderer_resetFramePerfCounters(renderer);
     N3DSRenderer_computeFrameLayout(renderer, gameW, gameH);
+    renderer->lastGameW = gameW;
+    renderer->lastGameH = gameH;
 
     if (renderer->pendingOld3DSAtlasFlush && !renderer->isNew3DS) {
         renderer->pendingOld3DSAtlasFlush = false;
@@ -3416,14 +3467,112 @@ static void N3DSRenderer_beginFrame(Renderer* base, int32_t gameW, int32_t gameH
         N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_BOTTOM, true);
         C2D_TargetClear(renderer->bottomTarget, C2D_Color32(0, 0, 0, 255));
     }
+    renderer->passTarget = N3DS_SCENE_TARGET_TOP;
     N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_TOP, true);
-    C2D_TargetClear(renderer->topTarget, N3DSRenderer_makeColor(renderer->clearColor, renderer->clearAlpha));
+    C3D_RenderTarget* topClearTarget = (renderer->mirrorEnabled && !renderer->splitFrame) ? renderer->mirrorTarget : renderer->topTarget;
+    C2D_TargetClear(topClearTarget, N3DSRenderer_makeColor(renderer->clearColor, renderer->clearAlpha));
+}
+
+// ===[ Two-screen layouts ]===
+
+void N3DSRenderer_setSplitFrame(Renderer* base, bool split) {
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer == NULL) return;
+    renderer->splitFrame = split && renderer->bottomTarget != NULL;
+}
+
+// Where game-window pixels land on the touchscreen: screen = game * scale + offset. Used to present the
+// mirror texture on the bottom screen and to turn stylus points back into game coordinates.
+void N3DSRenderer_setBottomMapping(Renderer* base, float scale, float offsetX, float offsetY) {
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer == NULL || scale <= 0.0f) return;
+    renderer->bottomScale = scale;
+    renderer->bottomOffsetX = offsetX;
+    renderer->bottomOffsetY = offsetY;
+}
+
+// Starts a draw pass of a split frame: following view drawing goes to one screen with this scale/offset.
+void N3DSRenderer_beginPass(Renderer* base, bool bottom, float scale, float offsetX, float offsetY) {
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer == NULL || !renderer->splitFrame) return;
+    N3DSRenderer_flushC2DQueue(renderer);
+    renderer->passTarget = bottom ? N3DS_SCENE_TARGET_BOTTOM : N3DS_SCENE_TARGET_TOP;
+    renderer->frameScaleX = scale;
+    renderer->frameScaleY = scale;
+    renderer->frameOffsetX = offsetX;
+    renderer->frameOffsetY = offsetY;
+    if (bottom) N3DSRenderer_setBottomMapping(base, scale, offsetX, offsetY);
+    N3DSRenderer_setDefaultGPUState(renderer);
+    N3DSRenderer_sceneBeginTarget(renderer, N3DS_SCENE_TARGET_TOP, true);
+}
+
+// Solid rectangle in screen pixels on the current pass's screen (used to dim backdrops).
+void N3DSRenderer_fillPassRect(Renderer* base, float x, float y, float w, float h, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer == NULL) return;
+    N3DSRenderer_flushC2DQueue(renderer);
+    N3DSRenderer_setDefaultGPUState(renderer);
+    C2D_DrawRectSolid(x, y, 0.5f, w, h, C2D_Color32(r, g, b, a));
+    C2D_Flush();
+}
+
+// Mirror mode: show the finished game frame on both screens. Blending is off so the frame's own alpha can't darken it.
+// How the whole game window fits the top screen (the mirror texture's layout).
+static void N3DSRenderer_topFitLayout(const N3DSRenderer* renderer, float* scale, float* offsetX, float* offsetY) {
+    float gw = renderer->lastGameW > 0 ? (float) renderer->lastGameW : (float) N3DS_TOP_WIDTH;
+    float gh = renderer->lastGameH > 0 ? (float) renderer->lastGameH : (float) N3DS_TOP_HEIGHT;
+    float sx = (float) N3DS_TOP_WIDTH / gw;
+    float sy = (float) N3DS_TOP_HEIGHT / gh;
+    *scale = sx < sy ? sx : sy;
+    *offsetX = ((float) N3DS_TOP_WIDTH - gw * *scale) * 0.5f;
+    *offsetY = ((float) N3DS_TOP_HEIGHT - gh * *scale) * 0.5f;
+}
+
+static void N3DSRenderer_presentMirror(N3DSRenderer* renderer) {
+    if (!renderer->mirrorEnabled || renderer->splitFrame) return;
+    N3DSRenderer_flushC2DQueue(renderer);
+    C2D_Flush();
+    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+    C3D_AlphaTest(false, GPU_ALWAYS, 0);
+
+    C2D_TargetClear(renderer->topTarget, C2D_Color32(0, 0, 0, 255));
+    C2D_SceneBegin(renderer->topTarget);
+    C2D_DrawImageAt(renderer->mirrorImage, 0.0f, 0.0f, 0.5f, NULL, 1.0f, 1.0f);
+    C2D_Flush();
+
+    // The mirror holds the frame in top-screen layout (fit into 400x240); re-map it through the bottom mapping.
+    float topScale, topOffsetX, topOffsetY;
+    N3DSRenderer_topFitLayout(renderer, &topScale, &topOffsetX, &topOffsetY);
+    float k = renderer->bottomScale / topScale;
+    C2D_TargetClear(renderer->bottomTarget, C2D_Color32(0, 0, 0, 255));
+    C2D_SceneBegin(renderer->bottomTarget);
+    C2D_DrawImageAt(renderer->mirrorImage, renderer->bottomOffsetX - topOffsetX * k, renderer->bottomOffsetY - topOffsetY * k, 0.5f, NULL, k, k);
+    C2D_Flush();
+
+    renderer->activeSceneTarget = N3DS_SCENE_TARGET_BOTTOM;
+    N3DSRenderer_setDefaultGPUState(renderer);
+}
+
+// Converts a touchscreen point into game-window pixels (the space view ports use). Returns false if the renderer can't map it.
+bool N3DSRenderer_touchToGame(Renderer* base, float touchX, float touchY, float* outGameX, float* outGameY) {
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    if (renderer == NULL || renderer->bottomScale <= 0.0f || renderer->lastGameW <= 0 || renderer->lastGameH <= 0) return false;
+    float gx = (touchX - renderer->bottomOffsetX) / renderer->bottomScale;
+    float gy = (touchY - renderer->bottomOffsetY) / renderer->bottomScale;
+    if (gx < 0.0f) gx = 0.0f;
+    if (gy < 0.0f) gy = 0.0f;
+    if (gx > (float) (renderer->lastGameW - 1)) gx = (float) (renderer->lastGameW - 1);
+    if (gy > (float) (renderer->lastGameH - 1)) gy = (float) (renderer->lastGameH - 1);
+    *outGameX = gx;
+    *outGameY = gy;
+    return true;
 }
 
 static void N3DSRenderer_endFrame(MAYBE_UNUSED Renderer* base) {
     N3DSRenderer* renderer = (N3DSRenderer*) base;
     N3DSRenderer_logPerfWindowIfNeeded(renderer);
     N3DSRenderer_flushC2DQueue(renderer);
+    N3DSRenderer_presentMirror(renderer);
     C2D_Flush();
     renderer->pendingC2DDraws = 0;
     renderer->lastDrawTexture = NULL;
@@ -3866,6 +4015,12 @@ static void N3DSRenderer_drawSpritePart(Renderer* base, int32_t tpagIndex, int32
     }
 
     N3DSRenderer* renderer = (N3DSRenderer*) base;
+    // Unrotated parts don't need a pivot. draw_sprite_part passes (0, 0), which as a pivot pushed the part away from
+    // (x, y): DoodleBob's health bar fill (drawn at view_xview + 10) never showed.
+    if (fabsf(angleDeg) < 0.001f) {
+        pivotX = x;
+        pivotY = y;
+    }
     N3DSDynamicCaptureTPAG* dynamicCapture = N3DSRenderer_getDynamicCaptureTPAG(renderer, tpagIndex);
     N3DSRenderer_traceTPAGUsage(renderer, N3DS_TRACE_KIND_SPRITE_PART, tpagIndex);
     renderer->frameSpritePartDrawCalls++;
@@ -5520,4 +5675,12 @@ void N3DSRenderer_destroyTileLayerChunkCache(Renderer* base, int32_t cacheId) {
     N3DSRenderer* renderer = (N3DSRenderer*) base;
     if (cacheId < 0 || (size_t) cacheId >= arrlenu(renderer->tileLayerChunkCaches)) return;
     N3DSRenderer_freeTileLayerChunkCache(renderer, &renderer->tileLayerChunkCaches[cacheId]);
+}
+
+void N3DSRenderer_getFrameStats(Renderer* base, uint32_t* pageImports, uint32_t* blobReads, uint32_t* evictions, uint32_t* assetLoads) {
+    N3DSRenderer* renderer = (N3DSRenderer*) base;
+    *pageImports = renderer->framePageImports;
+    *blobReads = renderer->frameBlobReads;
+    *evictions = renderer->frameImportEvictions;
+    *assetLoads = renderer->frameDirectAssetLoads;
 }

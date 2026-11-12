@@ -162,6 +162,12 @@ typedef enum {
     BUILTIN_VAR_KEYBOARD_LASTCHAR,
     BUILTIN_VAR_KEYBOARD_LASTKEY,
 
+    // Mouse
+    BUILTIN_VAR_MOUSE_BUTTON,
+    BUILTIN_VAR_MOUSE_LASTBUTTON,
+    BUILTIN_VAR_MOUSE_X,
+    BUILTIN_VAR_MOUSE_Y,
+
     // Surfaces
     BUILTIN_VAR_APPLICATION_SURFACE,
 
@@ -240,3 +246,5 @@ int16_t VMBuiltins_resolveBuiltinVarId(const char* name);
 void VMBuiltins_checkIfBuiltinVarTableIsSorted(void);
 RValue VMBuiltins_getVariable(VMContext* ctx, int16_t builtinVarId, const char* name, int32_t arrayIndex);
 void VMBuiltins_setVariable(VMContext* ctx, int16_t builtinVarId, const char* name, RValue val, int32_t arrayIndex);
+// GameMaker 1.x legacy globals stored as plain values (health, lives, score). False until the game has used one.
+bool VMBuiltins_getLegacyGlobalReal(const char* name, GMLReal* out);

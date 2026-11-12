@@ -8,3 +8,11 @@ resources/3ds/romfs/audio/
 resources/3ds/romfs/borders/
 resources/3ds/romfs/gfx/
 resources/3ds/romfs/*.bcwav
+
+# DoodleBob port: never commit game data, decompiled code or converted assets
+data.win
+*.win
+game-data/
+analysis/dump/
+resources/3ds/romfs/gfx/
+resources/3ds/romfs/audio/

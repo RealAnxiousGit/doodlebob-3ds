@@ -1,3 +1,4 @@
+#include <malloc.h>
 #include "../data_win.h"
 #include "../runner.h"
 #include "../runner_keyboard.h"
@@ -6,13 +7,17 @@
 
 #include "n3ds_audio_system.h"
 #include "n3ds_file_system.h"
+#include "n3ds_dialogue.h"
+#include "n3ds_layout.h"
 #include "n3ds_renderer.h"
+#include "n3ds_settings.h"
 
 #include <3ds.h>
 #include <citro2d.h>
 
 #include <ctype.h>
 #include <math.h>
+#include <stb/ds/stb_ds.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -378,7 +383,7 @@ static bool N3DS_tryLoadRoomBorderSprite(const char* assetName, C2D_Sprite* outS
     if (assetName == NULL || outSprite == NULL || outSheet == NULL) return false;
 
     char candidatePaths[2][256];
-    snprintf(candidatePaths[0], sizeof(candidatePaths[0]), "sdmc:/3ds/cinnamon/gfx/borders/%s.t3x", assetName);
+    snprintf(candidatePaths[0], sizeof(candidatePaths[0]), "sdmc:/3ds/DoodleBob/gfx/borders/%s.t3x", assetName);
     snprintf(candidatePaths[1], sizeof(candidatePaths[1]), "romfs:/gfx/borders/%s.t3x", assetName);
 
     repeat(2, i) {
@@ -458,9 +463,35 @@ static void N3DS_drawFallbackRoomBorder(void) {
     C2D_DrawRectSolid(outer + inner, screenH - outer - inner - 1.0f, overlayDepth, screenW - (outer + inner) * 2.0f, 1.0f, highlightColor);
 }
 
+#define N3DS_SAVE_DIR "sdmc:/3ds/DoodleBob/"
+
 static char* chooseDataWinPath(void) {
     if (fileExists("romfs:/data.win")) return safeStrdup("romfs:/data.win");
-    return safeStrdup("sdmc:/3ds/cinnamon/data.win");
+    return safeStrdup(N3DS_SAVE_DIR "data.win");
+}
+
+// Stylus -> mouse. Touching is the left button (draw); holding L or R while touching is the right button (erase).
+// padPress: the menu selector holds the left button (A held on a highlighted button; the selector placed the mouse).
+static void N3DS_syncTouch(Runner* runner, Renderer* renderer, u32 held, int32_t* activeButton, bool padPress) {
+    RunnerMouseState* mouse = runner->mouse;
+    int32_t wanted = GML_MB_NONE;
+    if (held & KEY_TOUCH) {
+        touchPosition touch;
+        hidTouchRead(&touch);
+        float gx, gy;
+        if (N3DSRenderer_touchToGame(renderer, (float) touch.px, (float) touch.py, &gx, &gy)) {
+            mouse->screenX = gx;
+            mouse->screenY = gy;
+        }
+        wanted = (held & (KEY_L | KEY_R)) ? GML_MB_RIGHT : GML_MB_LEFT;
+    } else if (padPress) {
+        wanted = GML_MB_LEFT;
+    }
+    if (*activeButton != wanted) {
+        if (*activeButton != GML_MB_NONE) RunnerMouse_onButtonUp(mouse, *activeButton);
+        if (wanted != GML_MB_NONE) RunnerMouse_onButtonDown(mouse, wanted);
+        *activeButton = wanted;
+    }
 }
 
 static void syncKey(RunnerKeyboardState* keyboard, bool* state, int32_t key, bool held) {
@@ -685,7 +716,19 @@ int main(int argc, char** argv) {
     }
 
     mkdir("sdmc:/3ds", 0777);
-    mkdir("sdmc:/3ds/cinnamon", 0777);
+    mkdir(N3DS_SAVE_DIR, 0777);
+
+    // Test switch: an empty "debuglog" file next to the save sends stdout/stderr to the debug service
+    // (Azahar shows it in its log). Off by default; every write is a system call.
+    bool debugLogEnabled = fileExists(N3DS_SAVE_DIR "debuglog");
+    if (debugLogEnabled) consoleDebugInit(debugDevice_SVC);
+    // Second test switch: an empty "debugfile" sends stderr to debug.txt on the SD card instead, line by line
+    // (Azahar's own log is buffered and loses its last lines when the emulator is closed).
+    if (debugLogEnabled && fileExists(N3DS_SAVE_DIR "debugfile") && freopen(N3DS_SAVE_DIR "debug.txt", "w", stderr) != NULL) {
+        setvbuf(stderr, NULL, _IOLBF, 0);
+    }
+    u64 perfStepTicks = 0, perfDrawTicks = 0, perfWindowStart = svcGetSystemTick();
+    int32_t perfFrames = 0;
 
     char* dataWinPath = chooseDataWinPath();
 
@@ -744,13 +787,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    FileSystem* fileSystem = (FileSystem*) N3DSFileSystem_create("romfs:/", "sdmc:/3ds/cinnamon/");
+    FileSystem* fileSystem = (FileSystem*) N3DSFileSystem_create("romfs:/", N3DS_SAVE_DIR);
     AudioSystem* audioSystem = (AudioSystem*) N3DSAudioSystem_create();
     N3DSLoadingScreen_set(&loadingScreen, "Loading sound bank", 1, 2);
     audioSystem->vtable->init(audioSystem, dataWin, fileSystem);
 
     N3DSLoadingScreen_set(&loadingScreen, "Initializing renderer", 2, 2);
     VMContext* vm = VM_create(dataWin);
+    N3DSDialogue_install(vm, dataWin);
+    N3DSSettings_init(vm, dataWin, audioSystem);
     Renderer* renderer = N3DSRenderer_create();
     Runner* runner = Runner_create(dataWin, vm, renderer, fileSystem, audioSystem);
 
@@ -780,75 +825,199 @@ int main(int argc, char** argv) {
     runner->osType = OS_3DS;
     Runner_initFirstRoom(runner);
 
-    bool haveRoomBorder = false;
-    C2D_Sprite roomBorder;
-    memset(&roomBorder, 0, sizeof(roomBorder));
-    C2D_SpriteSheet roomBorderSheet = NULL;
-    char loadedRoomBorderAsset[32] = "";
     bool debugMonitorVisible = false;
-    N3DS_refreshRoomBorderSprite(runner->currentRoom, &roomBorder, &roomBorderSheet, &haveRoomBorder, loadedRoomBorderAsset, sizeof(loadedRoomBorderAsset));
 
+    // Controls (DoodleBob): D-pad / Circle Pad = arrows, A = jump (Up), B / X = Space (skip cutscenes),
+    // START = Enter (pause / confirm), SELECT = Escape (back). Stylus = mouse (L/R + stylus = erase).
+    // L + R + SELECT toggles the debug monitor.
     bool leftHeld = false, rightHeld = false, upHeld = false, downHeld = false;
-    bool aHeld = false, bHeld = false, yHeld = false;
-    bool lHeld = false, rHeld = false;
+    bool spaceHeld = false, enterHeld = false, escapeHeld = false;
+    int32_t touchButton = GML_MB_NONE;
+    bool dialogueTap = false;
+    N3DSLayout layout;
+    N3DSLayout_init(&layout, runner);
+
+    // Test switch (with debuglog): a "debugroom" file holding a room name jumps there on reaching the level select,
+    // so later rooms (bosses) can be checked without playing through. Globals are set up by then.
+    int32_t debugJumpRoom = -1;
+    if (debugLogEnabled) {
+        FILE* jump = fopen(N3DS_SAVE_DIR "debugroom", "r");
+        if (jump != NULL) {
+            char name[64] = { 0 };
+            if (fgets(name, sizeof(name), jump) != NULL) {
+                name[strcspn(name, "\r\n ")] = '\0';
+                repeat(dataWin->room.count, i) {
+                    if (dataWin->room.rooms[i].name != NULL && strcmp(dataWin->room.rooms[i].name, name) == 0) debugJumpRoom = (int32_t) i;
+                }
+            }
+            fclose(jump);
+        }
+    }
+
+    int32_t objMouseControl = -1;
+    repeat(dataWin->objt.count, i) {
+        if (dataWin->objt.objects[i].name != NULL && strcmp(dataWin->objt.objects[i].name, "obj_mousecontrol") == 0) objMouseControl = (int32_t) i;
+    }
+    // Settings screen: while it is open the game is paused and gets no input; after it closes, buttons still held
+    // (the tap or A that closed it) stay hidden from the game until released.
+    const u32 settingsBlockKeys = KEY_TOUCH | KEY_A | KEY_B | KEY_X | KEY_START | KEY_SELECT;
+    bool settingsBlock = false;
+    // Drawing sensitivity: the last stylus point while drawing, in game-window pixels.
+    bool inkHadPoint = false;
+    float inkPrevX = 0.0f, inkPrevY = 0.0f;
 
     Gen8* gen8 = &dataWin->gen8;
     int32_t gameW = (int32_t) gen8->defaultWindowWidth;
     int32_t gameH = (int32_t) gen8->defaultWindowHeight;
 
-    const u64 frameTicks = (SYSCLOCK_ARM11 + 15u) / 30u;
+    // Pace by room speed. At room speed 60 the game runs two logic steps per drawn frame (60 logic / 30 drawn).
     u64 nextFrameTick = svcGetSystemTick();
     while (aptMainLoop() && !runner->shouldExit) {
+        int32_t roomSpeed = runner->currentRoom != NULL ? (int32_t) runner->currentRoom->speed : 30;
+        if (roomSpeed <= 0) roomSpeed = 30;
+        int32_t stepsPerFrame = roomSpeed > 30 ? 2 : 1;
+        u64 frameTicks = (SYSCLOCK_ARM11 + (u64) (roomSpeed / stepsPerFrame) / 2u) / (u64) (roomSpeed / stepsPerFrame);
         N3DS_beginPacedFrame(&nextFrameTick, frameTicks);
+
         hidScanInput();
         u32 held = hidKeysHeld();
         u32 down = hidKeysDown();
-
-        if (down & KEY_START) break;
-        if (down & KEY_SELECT) debugMonitorVisible = !debugMonitorVisible;
-        bool debugWarpToAsriel = debugMonitorVisible && (down & KEY_L) &&
-            (uint32_t) N3DS_DEBUG_ASRIEL_ROOM < runner->dataWin->room.count;
-        if (debugWarpToAsriel) {
-            runner->pendingRoom = N3DS_DEBUG_ASRIEL_ROOM;
+        bool settingsOpen = N3DSSettings_isOpen();
+        if (settingsOpen) {
+            N3DSSettings_update(runner, down, held);
+            settingsBlock = true;
+            held = 0;
+            down = 0;
+        } else if (settingsBlock) {
+            if ((held & settingsBlockKeys) == 0) settingsBlock = false;
+            held &= ~settingsBlockKeys;
+            down &= ~settingsBlockKeys;
         }
+
+        bool debugCombo = (held & KEY_L) && (held & KEY_R) && (down & KEY_SELECT);
+        if (debugCombo) debugMonitorVisible = !debugMonitorVisible;
 
         circlePosition circle;
         hidCircleRead(&circle);
 
         syncKey(runner->keyboard, &leftHeld, VK_LEFT, (held & KEY_LEFT) || circle.dx < -80);
         syncKey(runner->keyboard, &rightHeld, VK_RIGHT, (held & KEY_RIGHT) || circle.dx > 80);
-        syncKey(runner->keyboard, &upHeld, VK_UP, (held & KEY_UP) || circle.dy > 80);
+        syncKey(runner->keyboard, &upHeld, VK_UP, (held & (KEY_UP | KEY_A)) || circle.dy > 80);
         syncKey(runner->keyboard, &downHeld, VK_DOWN, (held & KEY_DOWN) || circle.dy < -80);
+        // The touchscreen shows a different region per layout; map the stylus through this frame's layout.
+        N3DSLayout_prepare(&layout, runner, renderer, gameW, gameH);
+        // While a dialogue panel fills the touchscreen, a tap that starts on it advances the line like B.
+        bool dialogueUp = layout.kind == N3DS_LAYOUT_DIALOGUE || layout.kind == N3DS_LAYOUT_NARRATOR;
+        if (down & KEY_TOUCH) dialogueTap = dialogueUp;
+        if (!(held & KEY_TOUCH)) dialogueTap = false;
+        syncKey(runner->keyboard, &spaceHeld, VK_SPACE, (held & (KEY_B | KEY_X)) != 0 || dialogueTap);
+        syncKey(runner->keyboard, &enterHeld, VK_ENTER, (held & KEY_START) != 0);
+        syncKey(runner->keyboard, &escapeHeld, VK_ESCAPE, (held & KEY_SELECT) && !debugCombo && !((held & KEY_L) && (held & KEY_R)));
+        bool padPress = false;
+        N3DSLayout_updateSelector(&layout, runner, down, held, &padPress);
+        N3DS_syncTouch(runner, renderer, dialogueUp ? 0 : held, &touchButton, padPress);
 
-        syncKey(runner->keyboard, &aHeld, 'Z', (held & KEY_A));
-        syncKey(runner->keyboard, &bHeld, 'X', (held & KEY_B));
-        syncKey(runner->keyboard, &yHeld, 'C', (held & KEY_Y) || (held & KEY_X));
-        syncKey(runner->keyboard, &lHeld, VK_PAGEDOWN, (held & KEY_L) && !debugWarpToAsriel);
-        syncKey(runner->keyboard, &rHeld, VK_PAGEUP, (held & KEY_R));
+        if (debugJumpRoom >= 0 && runner->currentRoom != NULL && runner->currentRoom->name != NULL && strcmp(runner->currentRoom->name, "rm_levelselect") == 0) {
+            runner->pendingRoom = debugJumpRoom;
+            debugJumpRoom = -1;
+        }
+        // Drawing sensitivity: a fast stroke moves the stylus far between frames and the game only inks where the
+        // stylus is each step, so the line breaks up. Run obj_mousecontrol's Begin Step (which places one ink piece
+        // under the mouse) at points every N px along the way from the last reading.
+        float inkSpacing = N3DSSettings_inkSpacing();
+        bool inking = !settingsOpen && layout.kind == N3DS_LAYOUT_GAME && touchButton == GML_MB_LEFT;
+        if (inking && inkHadPoint && inkSpacing > 0.0f && objMouseControl >= 0) {
+            RunnerMouseState* mouse = runner->mouse;
+            float dx = mouse->screenX - inkPrevX, dy = mouse->screenY - inkPrevY;
+            int32_t pieces = (int32_t) (sqrtf(dx * dx + dy * dy) / inkSpacing);
+            if (pieces > 1 && pieces < 128) {
+                float endX = mouse->screenX, endY = mouse->screenY;
+                int32_t count = (int32_t) arrlen(runner->instances);
+                Instance* control = NULL;
+                repeat(count, i) {
+                    Instance* inst = runner->instances[i];
+                    if (inst != NULL && !inst->destroyed && inst->active && inst->objectIndex == objMouseControl) control = inst;
+                }
+                if (control != NULL) {
+                    for (int32_t k = 1; k < pieces; k++) {
+                        mouse->screenX = inkPrevX + dx * (float) k / (float) pieces;
+                        mouse->screenY = inkPrevY + dy * (float) k / (float) pieces;
+                        Runner_executeEvent(runner, control, EVENT_STEP, STEP_BEGIN);
+                    }
+                }
+                mouse->screenX = endX;
+                mouse->screenY = endY;
+            }
+        }
+        inkHadPoint = inking;
+        inkPrevX = runner->mouse->screenX;
+        inkPrevY = runner->mouse->screenY;
 
-        Runner_step(runner);
-        N3DS_tryTriggerAsrielLed(runner);
-        runner->audioSystem->vtable->update(runner->audioSystem, 1.0f / 30.0f);
-        N3DS_refreshRoomBorderSprite(runner->currentRoom, &roomBorder, &roomBorderSheet, &haveRoomBorder, loadedRoomBorderAsset, sizeof(loadedRoomBorderAsset));
+        u64 stepStartTick = svcGetSystemTick();
+        // While Settings is open the game waits (no steps; input edges are kept for the first step after it closes).
+        if (!settingsOpen) repeat(stepsPerFrame, stepIndex) {
+            Runner_step(runner);
+            // Pressed/released edges belong to the first step only.
+            RunnerKeyboard_beginFrame(runner->keyboard);
+            RunnerMouse_beginFrame(runner->mouse);
+            if (runner->shouldExit) break;
+        }
+        runner->audioSystem->vtable->update(runner->audioSystem, (float) stepsPerFrame / (float) roomSpeed);
+        if (debugLogEnabled) N3DSLayout_debugTrace(&layout, runner);
 
         float displayScaleX = 1.0f;
         float displayScaleY = 1.0f;
         Runner_computeViewDisplayScale(runner, gameW, gameH, &displayScaleX, &displayScaleY);
+        u64 drawStartTick = svcGetSystemTick();
         u64 renderStartMs = osGetTime();
+        // The steps may have changed room, so pick the layout again before drawing.
+        N3DSLayout_prepare(&layout, runner, renderer, gameW, gameH);
         C3D_FrameBegin(0);
         renderer->vtable->beginFrame(renderer, gameW, gameH, 400, 240);
-        Runner_drawViews(runner, gameW, gameH, displayScaleX, displayScaleY, false);
-        N3DSRenderer_beginOverlay(renderer);
-        if (haveRoomBorder) C2D_DrawSprite(&roomBorder);
-        else N3DS_drawFallbackRoomBorder();
+        if (N3DSSettings_isOpen()) N3DSSettings_draw(runner, renderer);
+        else N3DSLayout_draw(&layout, runner, renderer, gameW, gameH, displayScaleX, displayScaleY);
+        renderer->vtable->endFrame(renderer);
         if (debugMonitorVisible) {
             N3DSDebugMonitor_draw(&debugMonitor, runner, renderer);
         }
-        renderer->vtable->endFrame(renderer);
         C3D_FrameEnd(0);
         N3DSDebugMonitor_tickFrame(&debugMonitor, (double) (osGetTime() - renderStartMs));
 
-        RunnerKeyboard_beginFrame(runner->keyboard);
+        if (debugLogEnabled) {
+            u64 endTick = svcGetSystemTick();
+            {
+                double tickMsF = 1000.0 / (double) SYSCLOCK_ARM11;
+                double stepMsF = (double) (drawStartTick - stepStartTick) * tickMsF;
+                double drawMsF = (double) (endTick - drawStartTick) * tickMsF;
+                if (stepMsF + drawMsF > 40.0) {
+                    uint32_t imp, blob, evi, assets;
+                    N3DSRenderer_getFrameStats(renderer, &imp, &blob, &evi, &assets);
+                    fprintf(stderr, "PERF SLOWFRAME room=%s step=%.1f draw=%.1f imports=%lu blobReads=%lu evictions=%lu assetLoads=%lu top=%s %.1fms\n",
+                        runner->currentRoom != NULL ? runner->currentRoom->name : "?", stepMsF, drawMsF,
+                        (unsigned long) imp, (unsigned long) blob, (unsigned long) evi, (unsigned long) assets,
+                        runner->frameStepTopObjectIndex >= 0 ? runner->dataWin->objt.objects[runner->frameStepTopObjectIndex].name : "-",
+                        runner->frameStepTopObjectMs);
+                }
+            }
+            perfStepTicks += drawStartTick - stepStartTick;
+            perfDrawTicks += endTick - drawStartTick;
+            perfFrames++;
+            if (perfFrames >= 30) {
+                double tickMs = 1000.0 / (double) SYSCLOCK_ARM11;
+                fprintf(stderr, "PERF heap=%luKB linearFree=%luKB room=%s speed=%ld step=%.2fms draw=%.2fms wall=%.2fms instances=%ld\n",
+                    (unsigned long) (mallinfo().uordblks / 1024u), (unsigned long) (linearSpaceFree() / 1024u),
+                    runner->currentRoom != NULL ? runner->currentRoom->name : "?", (long) roomSpeed,
+                    (double) perfStepTicks * tickMs / perfFrames, (double) perfDrawTicks * tickMs / perfFrames,
+                    (double) (endTick - perfWindowStart) * tickMs / perfFrames, (long) arrlen(runner->instances));
+                const char* topName = runner->frameStepTopObjectIndex >= 0 ? runner->dataWin->objt.objects[runner->frameStepTopObjectIndex].name : "-";
+                fprintf(stderr, "PERF  last step: prep=%.1f events=%.1f motion=%.1f collision=%.1f finalize=%.1f top=%s %.1fms x%lu\n",
+                    runner->frameStepPrepMs, runner->frameStepEventMs, runner->frameStepMotionMs, runner->frameStepCollisionMs,
+                    runner->frameStepFinalizeMs, topName, runner->frameStepTopObjectMs, (unsigned long) runner->frameStepTopObjectCalls);
+                perfStepTicks = perfDrawTicks = 0;
+                perfFrames = 0;
+                perfWindowStart = endTick;
+            }
+        }
     }
 
     audioSystem->vtable->destroy(audioSystem);
@@ -858,10 +1027,6 @@ int main(int argc, char** argv) {
     VM_free(vm);
     DataWin_free(dataWin);
     N3DSDebugMonitor_free(&debugMonitor);
-
-    if (roomBorderSheet != NULL) {
-        C2D_SpriteSheetFree(roomBorderSheet);
-    }
 
     if (citroReady) {
         C2D_Fini();

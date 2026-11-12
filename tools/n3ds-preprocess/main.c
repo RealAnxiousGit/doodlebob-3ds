@@ -1,6 +1,7 @@
 #include "../../src/data_win.h"
 #include "../../src/gl/image_decoder.h"
 #include "../../src/utils.h"
+#include "native_t3x.h"
 
 #include <stb/ds/stb_ds.h>
 #include <stb/image/stb_image.h>
@@ -13,6 +14,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define STB_VORBIS_HEADER_ONLY
 #include "../../vendor/stb/vorbis/stb_vorbis.c"
@@ -297,6 +302,12 @@ static bool readRegistryString(HKEY root, const char* subKey, const char* valueN
 }
 #endif
 
+// Write .t3x files with the built-in encoder (native_t3x.c) instead of tex3ds: set by --native-t3x, or when no
+// tex3ds is found. Formats the encoder lacks (etc1, etc1a4) still need tex3ds.
+static bool g_nativeT3x = false;
+// Rows go top to bottom, as tex3ds writes them (checked against its output).
+#define NATIVE_T3X_FLIP false
+
 static void applyDefaultToolPaths(Options* out) {
     if (out == NULL) return;
 
@@ -399,6 +410,10 @@ static bool parseArgs(int argc, char** argv, Options* out) {
         }
         if (strcmp(argv[i], "--tex3ds") == 0 && i + 1 < argc) {
             out->tex3dsExe = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--native-t3x") == 0) {
+            g_nativeT3x = true;
             continue;
         }
         fprintf(stderr, "Unknown argument: %s\n", argv[i]);
@@ -1364,6 +1379,12 @@ static bool pixelsLookMonochrome(const uint8_t* rgba, uint32_t width, uint32_t h
 }
 
 static bool runTex3ds(const char* tex3dsExe, const char* pngPath, const char* t3xPath, N3DSTextureFormat format) {
+    if (g_nativeT3x) {
+        const char* name = getTex3dsFormatName(format);
+        if (NativeT3x_supportsFormat(name)) return NativeT3x_write(pngPath, t3xPath, name, NATIVE_T3X_FLIP);
+        fprintf(stderr, "native t3x: format %s needs tex3ds\n", name);
+        return false;
+    }
 #if N3DS_PREPROCESS_HOST_WINDOWS
     char tex3dsExeNormalized[1024];
     char pngPathNormalized[1024];
@@ -1386,7 +1407,7 @@ static bool runTex3ds(const char* tex3dsExe, const char* pngPath, const char* t3
     snprintf(
         command,
         sizeof(command),
-        "\"%s\" -f %s -z none -o \"%s\" \"%s\"",
+        "\"%s\" -f %s -z lz11 -o \"%s\" \"%s\"",
         tex3dsExeNormalized,
         getTex3dsFormatName(format),
         t3xPathNormalized,
@@ -1399,7 +1420,7 @@ static bool runTex3ds(const char* tex3dsExe, const char* pngPath, const char* t3
         "-f",
         getTex3dsFormatName(format),
         "-z",
-        "none",
+        "lz11",
         "-o",
         t3xPathNormalized,
         pngPathNormalized,
@@ -1415,7 +1436,7 @@ static bool runTex3ds(const char* tex3dsExe, const char* pngPath, const char* t3
     snprintf(
         command,
         sizeof(command),
-        "\"%s\" -f %s -z none -o \"%s\" \"%s\"",
+        "\"%s\" -f %s -z lz11 -o \"%s\" \"%s\"",
         tex3dsExe,
         getTex3dsFormatName(format),
         t3xPath,
@@ -1431,6 +1452,8 @@ static bool runTex3ds(const char* tex3dsExe, const char* pngPath, const char* t3
 }
 
 static bool runTex3dsAtlas(const char* tex3dsExe, const char* pngGlobPath, const char* t3xPath, N3DSTextureFormat format) {
+    // No atlas packing in the built-in encoder: the caller falls back to one .t3x per frame.
+    if (g_nativeT3x) return false;
 #if N3DS_PREPROCESS_HOST_WINDOWS
     char tex3dsExeNormalized[1024];
     char pngGlobPathNormalized[1024];
@@ -1453,7 +1476,7 @@ static bool runTex3dsAtlas(const char* tex3dsExe, const char* pngGlobPath, const
     snprintf(
         command,
         sizeof(command),
-        "\"%s\" --atlas -f %s -z none -o \"%s\" \"%s\"",
+        "\"%s\" --atlas -f %s -z lz11 -o \"%s\" \"%s\"",
         tex3dsExeNormalized,
         getTex3dsFormatName(format),
         t3xPathNormalized,
@@ -1467,7 +1490,7 @@ static bool runTex3dsAtlas(const char* tex3dsExe, const char* pngGlobPath, const
         "-f",
         getTex3dsFormatName(format),
         "-z",
-        "none",
+        "lz11",
         "-o",
         t3xPathNormalized,
         pngGlobPathNormalized,
@@ -1483,7 +1506,7 @@ static bool runTex3dsAtlas(const char* tex3dsExe, const char* pngGlobPath, const
     snprintf(
         command,
         sizeof(command),
-        "\"%s\" --atlas -f %s -z none -o \"%s\" \"%s\"",
+        "\"%s\" --atlas -f %s -z lz11 -o \"%s\" \"%s\"",
         tex3dsExe,
         getTex3dsFormatName(format),
         t3xPath,
@@ -3888,6 +3911,232 @@ static N3DS_PREPROCESS_MAYBE_UNUSED void freeWavPcm16(WavPcm16* wav) {
     memset(wav, 0, sizeof(*wav));
 }
 
+// ===[ Loudness (ITU-R BS.1770 / EBU R128) and a look-ahead peak limiter ]===
+// The game's music sits around -17 LUFS while its voice clips and effects reach -1 LUFS with clipped peaks.
+// Music is normalised to LOUDNESS_TARGET_LUFS (raised, with the limiter catching the peaks); any sound effect
+// whose loudest 400 ms is above SFX_MAX_LUFS is turned down to it. Everything goes through a look-ahead limiter
+// with a LIMITER_CEILING_DB sample-peak ceiling. The 3DS runner plays these at full volume (it treats the
+// game's sound_global_volume(0.75) as 1.0), so they play at these levels.
+#define LOUDNESS_TARGET_LUFS -11.0
+#define SFX_MAX_LUFS -9.0
+#define LOUDNESS_MAX_BOOST_DB 18.0
+#define LIMITER_CEILING_DB -1.0
+#define LIMITER_LOOKAHEAD_MS 5.0
+#define LIMITER_RELEASE_MS 200.0
+
+typedef struct {
+    double integrated;  // gated integrated loudness, LUFS (-HUGE_VAL for silence)
+    double momentaryMax; // loudest 400 ms block, LUFS
+    double peakDb;      // sample peak, dBFS
+} LoudnessInfo;
+
+static void kWeightingCoefs(double fs, double b[5], double a[5]) {
+    // Two biquads from BS.1770 (high shelf + RLB high pass), re-derived for any sample rate, then cascaded.
+    double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
+    double K = tan(M_PI * f0 / fs);
+    double Vh = pow(10.0, G / 20.0);
+    double Vb = pow(Vh, 0.4996667741545416);
+    double a0 = 1.0 + K / Q + K * K;
+    double pb[3] = { (Vh + Vb * K / Q + K * K) / a0, 2.0 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0 };
+    double pa[3] = { 1.0, 2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0 };
+    f0 = 38.13547087602444;
+    Q = 0.5003270373238773;
+    K = tan(M_PI * f0 / fs);
+    double rb[3] = { 1.0, -2.0, 1.0 };
+    double ra[3] = { 1.0, 2.0 * (K * K - 1.0) / (1.0 + K / Q + K * K), (1.0 - K / Q + K * K) / (1.0 + K / Q + K * K) };
+    for (int i = 0; i < 5; i++) { b[i] = 0.0; a[i] = 0.0; }
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            b[i + j] += pb[i] * rb[j];
+            a[i + j] += pa[i] * ra[j];
+        }
+    }
+}
+
+static LoudnessInfo measureLoudness(const WavPcm16* wav) {
+    LoudnessInfo info = { -HUGE_VAL, -HUGE_VAL, -HUGE_VAL };
+    if (wav == NULL || wav->interleavedPcm == NULL || wav->sampleCount == 0 || wav->channelCount == 0) return info;
+    uint32_t frames = wav->sampleCount, channels = wav->channelCount;
+    double fs = (double) (wav->sampleRate != 0 ? wav->sampleRate : N3DS_AUDIO_SAMPLE_RATE);
+    double b[5], a[5];
+    kWeightingCoefs(fs, b, a);
+
+    // Mean square of the K-weighted signal per 100 ms step, summed over channels.
+    uint32_t step = (uint32_t) (fs * 0.1);
+    if (step == 0) step = 1;
+    uint32_t stepCount = (frames + step - 1u) / step;
+    double* stepEnergy = safeCalloc(stepCount, sizeof(double));
+    int32_t peak = 0;
+    for (uint32_t c = 0; c < channels; c++) {
+        double x1 = 0, x2 = 0, x3 = 0, x4 = 0, y1 = 0, y2 = 0, y3 = 0, y4 = 0;
+        for (uint32_t n = 0; n < frames; n++) {
+            int32_t s = wav->interleavedPcm[(size_t) n * channels + c];
+            int32_t mag = s < 0 ? -s : s;
+            if (mag > peak) peak = mag;
+            double x = (double) s / 32768.0;
+            double y = b[0] * x + b[1] * x1 + b[2] * x2 + b[3] * x3 + b[4] * x4 - a[1] * y1 - a[2] * y2 - a[3] * y3 - a[4] * y4;
+            x4 = x3; x3 = x2; x2 = x1; x1 = x;
+            y4 = y3; y3 = y2; y2 = y1; y1 = y;
+            stepEnergy[n / step] += y * y;
+        }
+    }
+    info.peakDb = peak > 0 ? 20.0 * log10((double) peak / 32768.0) : -HUGE_VAL;
+
+    // 400 ms blocks with 75% overlap (4 steps). A sound shorter than one block is measured as one block.
+    uint32_t blockSteps = 4;
+    uint32_t blockCount = stepCount >= blockSteps ? stepCount - blockSteps + 1u : 1u;
+    double* blockZ = safeCalloc(blockCount, sizeof(double));
+    for (uint32_t j = 0; j < blockCount; j++) {
+        uint32_t first = j, last = j + blockSteps < stepCount ? j + blockSteps : stepCount;
+        double sum = 0.0;
+        for (uint32_t k = first; k < last; k++) sum += stepEnergy[k];
+        uint32_t len = (last == stepCount ? frames : last * step) - first * step;
+        blockZ[j] = len > 0 ? sum / (double) len : 0.0;
+        if (blockZ[j] > 0.0) {
+            double l = -0.691 + 10.0 * log10(blockZ[j]);
+            if (l > info.momentaryMax) info.momentaryMax = l;
+        }
+    }
+    // Absolute gate at -70 LUFS, then a relative gate 10 LU below the absolute-gated mean.
+    double sum = 0.0;
+    uint32_t count = 0;
+    double absGateZ = pow(10.0, (-70.0 + 0.691) / 10.0);
+    for (uint32_t j = 0; j < blockCount; j++) if (blockZ[j] > absGateZ) { sum += blockZ[j]; count++; }
+    if (count > 0) {
+        double relGateZ = (sum / count) * pow(10.0, -10.0 / 10.0);
+        double gated = 0.0;
+        uint32_t gatedCount = 0;
+        for (uint32_t j = 0; j < blockCount; j++) if (blockZ[j] > absGateZ && blockZ[j] > relGateZ) { gated += blockZ[j]; gatedCount++; }
+        if (gatedCount > 0) info.integrated = -0.691 + 10.0 * log10(gated / gatedCount);
+    }
+    free(stepEnergy);
+    free(blockZ);
+    return info;
+}
+
+// Multiplies by `gain` and keeps every sample under the ceiling. Gain reduction comes from a min-filter of the
+// needed gain (radius = look-ahead) smoothed by a box filter of the same radius, so it is already down when a
+// peak arrives, then recovers with an exponential release.
+static void applyGainWithLimiter(WavPcm16* wav, double gain, uint32_t* outLimitedFrames, double* outMaxReductionDb) {
+    *outLimitedFrames = 0;
+    *outMaxReductionDb = 0.0;
+    uint32_t frames = wav->sampleCount, channels = wav->channelCount;
+    if (frames == 0 || channels == 0) return;
+    double fs = (double) (wav->sampleRate != 0 ? wav->sampleRate : N3DS_AUDIO_SAMPLE_RATE);
+    double ceiling = pow(10.0, LIMITER_CEILING_DB / 20.0);
+    int32_t radius = (int32_t) (fs * LIMITER_LOOKAHEAD_MS / 1000.0);
+    if (radius < 1) radius = 1;
+
+    float* need = safeMalloc((size_t) frames * sizeof(float));
+    bool anyOver = false;
+    for (uint32_t n = 0; n < frames; n++) {
+        double peak = 0.0;
+        for (uint32_t c = 0; c < channels; c++) {
+            double v = fabs((double) wav->interleavedPcm[(size_t) n * channels + c] / 32768.0) * gain;
+            if (v > peak) peak = v;
+        }
+        need[n] = peak > ceiling ? (float) (ceiling / peak) : 1.0f;
+        if (peak > ceiling) anyOver = true;
+    }
+
+    float* env = NULL;
+    if (anyOver) {
+        // Sliding minimum over [n - radius, n + radius] with a monotonic deque.
+        float* minFiltered = safeMalloc((size_t) frames * sizeof(float));
+        uint32_t* dq = safeMalloc(((size_t) frames + 1u) * sizeof(uint32_t));
+        size_t head = 0, tail = 0;
+        uint32_t next = 0;
+        for (uint32_t n = 0; n < frames; n++) {
+            uint32_t right = n + (uint32_t) radius < frames ? n + (uint32_t) radius : frames - 1u;
+            while (next <= right) {
+                while (tail > head && need[dq[tail - 1]] >= need[next]) tail--;
+                dq[tail++] = next++;
+            }
+            uint32_t left = n >= (uint32_t) radius ? n - (uint32_t) radius : 0u;
+            while (dq[head] < left) head++;
+            minFiltered[n] = need[dq[head]];
+        }
+        free(dq);
+        // Box filter of the same radius (edges use the frames that exist).
+        env = safeMalloc((size_t) frames * sizeof(float));
+        double running = 0.0;
+        int32_t lo = 0, hi = -1;
+        for (int32_t n = 0; n < (int32_t) frames; n++) {
+            int32_t wantLo = n - radius < 0 ? 0 : n - radius;
+            int32_t wantHi = n + radius >= (int32_t) frames ? (int32_t) frames - 1 : n + radius;
+            while (hi < wantHi) running += minFiltered[++hi];
+            while (lo < wantLo) running -= minFiltered[lo++];
+            env[n] = (float) (running / (double) (hi - lo + 1));
+        }
+        free(minFiltered);
+        // Release: never rise faster than the release time constant.
+        double rel = 1.0 - exp(-1.0 / (fs * LIMITER_RELEASE_MS / 1000.0));
+        double g = env[0];
+        for (uint32_t n = 0; n < frames; n++) {
+            double recovered = g + (1.0 - g) * rel;
+            g = env[n] < recovered ? env[n] : recovered;
+            env[n] = (float) g;
+        }
+    }
+
+    double minGain = 1.0;
+    for (uint32_t n = 0; n < frames; n++) {
+        double g = env != NULL ? env[n] : 1.0;
+        if (g < 0.9999) (*outLimitedFrames)++;
+        if (g < minGain) minGain = g;
+        for (uint32_t c = 0; c < channels; c++) {
+            size_t i = (size_t) n * channels + c;
+            double v = (double) wav->interleavedPcm[i] * gain * g;
+            // Hard stop at the ceiling for anything the envelope smoothed past (rounding).
+            double limit = ceiling * 32767.0;
+            if (v > limit) v = limit;
+            if (v < -limit) v = -limit;
+            wav->interleavedPcm[i] = (int16_t) lrint(v);
+        }
+    }
+    *outMaxReductionDb = minGain < 1.0 ? -20.0 * log10(minGain) : 0.0;
+    free(env);
+    free(need);
+}
+
+// Music: normalised to the target. Sound effects: only turned down when louder than the target.
+static void normalizeLoudness(WavPcm16* wav, bool music, const char* name) {
+    if (wav == NULL || wav->interleavedPcm == NULL || wav->sampleCount == 0) return;
+    LoudnessInfo before = measureLoudness(wav);
+    double gainDb = 0.0;
+    if (music) {
+        if (isfinite(before.integrated)) gainDb = LOUDNESS_TARGET_LUFS - before.integrated;
+        if (gainDb > LOUDNESS_MAX_BOOST_DB) gainDb = LOUDNESS_MAX_BOOST_DB;
+    } else if (isfinite(before.momentaryMax) && before.momentaryMax > SFX_MAX_LUFS) {
+        gainDb = SFX_MAX_LUFS - before.momentaryMax;
+    }
+    uint32_t limitedFrames = 0;
+    double maxReductionDb = 0.0;
+    LoudnessInfo after = before;
+    if (music && gainDb > 0.0) {
+        // Limiting takes some loudness back, so re-measure and raise the gain until the result is on target.
+        size_t bytes = (size_t) wav->sampleCount * wav->channelCount * sizeof(int16_t);
+        int16_t* original = safeMalloc(bytes);
+        memcpy(original, wav->interleavedPcm, bytes);
+        for (int pass = 0; pass < 4; pass++) {
+            memcpy(wav->interleavedPcm, original, bytes);
+            applyGainWithLimiter(wav, pow(10.0, gainDb / 20.0), &limitedFrames, &maxReductionDb);
+            after = measureLoudness(wav);
+            double miss = LOUDNESS_TARGET_LUFS - after.integrated;
+            if (!isfinite(miss) || fabs(miss) < 0.25 || gainDb >= LOUDNESS_MAX_BOOST_DB) break;
+            gainDb += miss;
+            if (gainDb > LOUDNESS_MAX_BOOST_DB) gainDb = LOUDNESS_MAX_BOOST_DB;
+        }
+        free(original);
+    } else {
+        applyGainWithLimiter(wav, pow(10.0, gainDb / 20.0), &limitedFrames, &maxReductionDb);
+        after = measureLoudness(wav);
+    }
+    fprintf(stderr, "loudness %-5s %-28s I %6.1f -> %6.1f LUFS  M %6.1f -> %6.1f  peak %6.1f -> %5.1f dBFS  gain %+5.1f dB  limited %4.1f%% (max %.1f dB)\n",
+        music ? "music" : "sfx", name != NULL ? name : "?", before.integrated, after.integrated, before.momentaryMax, after.momentaryMax,
+        before.peakDb, after.peakDb, gainDb, 100.0 * (double) limitedFrames / (double) wav->sampleCount, maxReductionDb);
+}
+
 static N3DS_PREPROCESS_MAYBE_UNUSED bool parseBcwavInfo(const uint8_t* info, uint32_t infoSize, uint32_t dataBlockOffset, uint32_t fileSize, ParsedBcwav* out) {
     memset(out, 0, sizeof(*out));
     if (infoSize < 0x20 || memcmp(info, "INFO", 4) != 0) return false;
@@ -4060,7 +4309,7 @@ static bool nameLooksLikeMusic(const char* value) {
     if (backslash != NULL && (base == NULL || backslash > base)) base = backslash;
     base = (base != NULL) ? base + 1 : value;
     if (nameLooksLikeSfx(base)) return false;
-    if (strncmp(base, "mus_", 4) == 0 || strncmp(base, "bgm_", 4) == 0) return true;
+    if (strncmp(base, "mus_", 4) == 0 || strncmp(base, "bgm_", 4) == 0 || strncmp(base, "msc_", 4) == 0) return true;
     return stringContainsIgnoreCase(base, "music");
 }
 
@@ -4826,6 +5075,7 @@ static bool buildPackedSoundBank(Options* options, DataWin* dataWin) {
             freeWavPcm16(&pcm);
             continue;
         }
+        normalizeLoudness(&pcm, false, sound->name);
 
         uint32_t sampleRate = pcm.sampleRate != 0 ? pcm.sampleRate : N3DS_AUDIO_SAMPLE_RATE;
         uint32_t sampleCount = pcm.sampleCount;
@@ -4907,6 +5157,28 @@ static bool convertStreamedMusicBcwavs(Options* options, DataWin* dataWin) {
         snprintf(outPath, sizeof(outPath), "%s/%s.bcwav", options->outputDir, baseName);
 
         char* externalSourcePath = resolveExternalSoundPath(options, sound);
+        if (externalSourcePath == NULL && sound->audioFile >= 0 && (uint32_t) sound->audioFile < dataWin->audo.count) {
+            // Music embedded in AUDO (DoodleBob ships every msc_ track as WAV inside data.win): stream it as DSP-ADPCM.
+            AudioEntry* entry = &dataWin->audo.entries[sound->audioFile];
+            WavPcm16 pcm;
+            if (loadPcmForSoundBank(options, sound, entry->data, entry->dataSize, soundIndex, &pcm)) {
+                bool ok = resampleWavPcm16(&pcm, N3DS_AUDIO_SAMPLE_RATE);
+                if (ok) {
+                    normalizeLoudness(&pcm, true, sound->name);
+                    remove(outPath);
+                    fprintf(stderr, "n3ds-preprocess: music %05zu -> %s [embedded]\n", soundIndex, outPath);
+                    ok = writeBcwavFile(outPath, &pcm);
+                }
+                freeWavPcm16(&pcm);
+                if (ok) {
+                    convertedCount++;
+                } else {
+                    fprintf(stderr, "Failed to write embedded music BCWAV for sound %zu\n", soundIndex);
+                    allOk = false;
+                }
+                continue;
+            }
+        }
         if (externalSourcePath == NULL) {
             if (fileExists(outPath)) {
                 preservedCount++;
@@ -4975,6 +5247,11 @@ int main(int argc, char** argv) {
     if (options.inputPath == NULL || options.outputDir == NULL) {
         printUsage(argv[0]);
         return 1;
+    }
+
+    if (!g_nativeT3x && (options.tex3dsExe == NULL || !fileExists(options.tex3dsExe))) {
+        fprintf(stderr, "tex3ds not found; using the built-in .t3x encoder\n");
+        g_nativeT3x = true;
     }
 
     if (!normalizeInputDataWinPath(&options)) {

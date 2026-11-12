@@ -7,6 +7,7 @@ add_compile_options(-Wall -Wextra)
 
 add_executable(n3ds-preprocess
     main.c
+    native_t3x.c
     stb_impl.c
     ../../src/binary_reader.c
     ../../src/data_win.c

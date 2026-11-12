@@ -12,3 +12,5 @@ void N3DSAudioSystem_getCacheStats(
     uint32_t* outCachedBytes,
     uint32_t* outCacheLimitBytes
 );
+// Settings menu volumes (0..1): music (streamed tracks) and sound effects.
+void N3DSAudioSystem_setVolumes(AudioSystem* base, float music, float effects);

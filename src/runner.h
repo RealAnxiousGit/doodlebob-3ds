@@ -9,6 +9,7 @@
 #include "instance.h"
 #include "renderer.h"
 #include "runner_keyboard.h"
+#include "runner_mouse.h"
 #include "spatial_grid.h"
 #include "runner_gamepad.h"
 #include "vm.h"
@@ -23,6 +24,7 @@ void Runner_platformBootLog(const char* message);
 #define EVENT_STEP       3
 #define EVENT_COLLISION  4
 #define EVENT_KEYBOARD   5
+#define EVENT_MOUSE      6
 #define EVENT_OTHER      7
 #define EVENT_DRAW       8
 #define EVENT_KEYPRESS   9
@@ -43,6 +45,31 @@ void Runner_platformBootLog(const char* message);
 #define DRAW_GUI_END   75
 #define DRAW_PRE       76
 #define DRAW_POST      77
+
+// ===[ Mouse Sub-event Constants ]=== (backported from upstream main)
+#define MOUSE_LEFT_BUTTON 0
+#define MOUSE_RIGHT_BUTTON 1
+#define MOUSE_MIDDLE_BUTTON 2
+#define MOUSE_NO_BUTTON 3
+#define MOUSE_LEFT_PRESSED 4
+#define MOUSE_RIGHT_PRESSED 5
+#define MOUSE_MIDDLE_PRESSED 6
+#define MOUSE_LEFT_RELEASED 7
+#define MOUSE_RIGHT_RELEASED 8
+#define MOUSE_MIDDLE_RELEASED 9
+#define MOUSE_ENTER 10
+#define MOUSE_LEAVE 11
+#define MOUSE_GLOB_LEFT_BUTTON 50
+#define MOUSE_GLOB_RIGHT_BUTTON 51
+#define MOUSE_GLOB_MIDDLE_BUTTON 52
+#define MOUSE_GLOB_LEFT_PRESSED 53
+#define MOUSE_GLOB_RIGHT_PRESSED 54
+#define MOUSE_GLOB_MIDDLE_PRESSED 55
+#define MOUSE_GLOB_LEFT_RELEASED 56
+#define MOUSE_GLOB_RIGHT_RELEASED 57
+#define MOUSE_GLOB_MIDDLE_RELEASED 58
+#define MOUSE_WHEEL_UP 60
+#define MOUSE_WHEEL_DOWN 61
 
 // ===[ Other Sub-event Constants ]===
 #define OTHER_OUTSIDE_ROOM  0
@@ -367,6 +394,17 @@ typedef struct Runner {
     int frameCount;
     uint32_t nextInstanceId;
     RunnerKeyboardState* keyboard;
+    // Mouse (backported from upstream main). screenX/screenY are in game-window pixels (the space view ports live in), set by the platform layer.
+    RunnerMouseState* mouse;
+    // When false, the Undertale-specific 3DS battle/border/dialogue hacks are skipped entirely.
+    bool n3dsUndertaleHacks;
+    // Two-screen layouts: which instances (and whether backgrounds/tiles) the current draw pass includes.
+    // Zeroed = draw everything, so platforms that never set it are unaffected.
+    uint8_t drawPassMode; // RUNNER_DRAW_PASS_*
+    bool drawPassNoBackgrounds;
+    bool drawPassNoTiles;
+    int32_t drawPassObjects[48];
+    int32_t drawPassObjectCount;
     RuntimeView views[MAX_VIEWS];
     RunnerGamepadState* gamepads;
     RuntimeBackground backgrounds[8];
@@ -504,6 +542,20 @@ void Runner_reset(Runner* runner);
 Runner* Runner_create(DataWin* dataWin, VMContext* vm, Renderer* renderer, FileSystem* fileSystem, AudioSystem* audioSystem);
 void Runner_initFirstRoom(Runner* runner);
 void Runner_step(Runner* runner);
+// Maps runner->mouse->screenX/screenY (game-window pixels) into room coordinates through the view under the cursor.
+void Runner_getMouseRoomPosition(Runner* runner, GMLReal* outX, GMLReal* outY);
+
+#define RUNNER_DRAW_PASS_ALL 0
+#define RUNNER_DRAW_PASS_EXCLUDE 1
+#define RUNNER_DRAW_PASS_ONLY 2
+static inline bool Runner_drawPassAllows(const Runner* runner, const Instance* inst) {
+    if (runner->drawPassMode == RUNNER_DRAW_PASS_ALL) return true;
+    bool listed = false;
+    for (int32_t i = 0; i < runner->drawPassObjectCount; i++) {
+        if (runner->drawPassObjects[i] == inst->objectIndex) { listed = true; break; }
+    }
+    return runner->drawPassMode == RUNNER_DRAW_PASS_ONLY ? listed : !listed;
+}
 void Runner_executeEvent(Runner* runner, Instance* instance, int32_t eventType, int32_t eventSubtype);
 void Runner_executeEventFromObject(Runner* runner, Instance* instance, int32_t startObjectIndex, int32_t eventType, int32_t eventSubtype);
 void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventSubtype);

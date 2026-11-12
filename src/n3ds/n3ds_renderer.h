@@ -4,8 +4,14 @@
 
 Renderer* N3DSRenderer_create(void);
 bool N3DSRenderer_isReady(Renderer* renderer);
+void N3DSRenderer_getFrameStats(Renderer* renderer, uint32_t* pageImports, uint32_t* blobReads, uint32_t* evictions, uint32_t* assetLoads);
 const char* N3DSRenderer_getStartupError(Renderer* renderer);
 void N3DSRenderer_beginOverlay(Renderer* renderer);
+bool N3DSRenderer_touchToGame(Renderer* renderer, float touchX, float touchY, float* outGameX, float* outGameY);
+void N3DSRenderer_setSplitFrame(Renderer* renderer, bool split);
+void N3DSRenderer_setBottomMapping(Renderer* renderer, float scale, float offsetX, float offsetY);
+void N3DSRenderer_beginPass(Renderer* renderer, bool bottom, float scale, float offsetX, float offsetY);
+void N3DSRenderer_fillPassRect(Renderer* renderer, float x, float y, float w, float h, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 void N3DSRenderer_beginBottomScreenGUIEx(Renderer* renderer, int32_t guiW, int32_t guiH, float scaleX, float scaleY, float offsetX, float offsetY);
 void N3DSRenderer_beginBottomScreenGUI(Renderer* renderer, int32_t guiW, int32_t guiH);
 void N3DSRenderer_endBottomScreenGUI(Renderer* renderer);

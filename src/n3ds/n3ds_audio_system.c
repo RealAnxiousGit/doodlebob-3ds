@@ -48,8 +48,8 @@
 #define N3DS_FORCE_PCM_BCWAV_PLAYBACK 0
 #define N3DS_ROMFS_AUDIO_BASE "romfs:/audio"
 #define N3DS_ROMFS_MUSIC_BASE "romfs:/"
-#define N3DS_SDMC_AUDIO_BASE "sdmc:/3ds/cinnamon/audio"
-#define N3DS_SDMC_MUSIC_BASE "sdmc:/3ds/cinnamon"
+#define N3DS_SDMC_AUDIO_BASE "sdmc:/3ds/DoodleBob/audio"
+#define N3DS_SDMC_MUSIC_BASE "sdmc:/3ds/DoodleBob"
 #define N3DS_MAX_MISSING_AUDIO_PATHS 512
 #define N3DS_SOUND_BANK_MAGIC 0x314B4253u /* SBK1 */
 #define N3DS_SOUND_BANK_VERSION_BCWAV 1u
@@ -687,7 +687,7 @@ static bool N3DSAudio_nameLooksLikeMusic(const char* value) {
     if (backslash != NULL && (base == NULL || backslash > base)) base = backslash;
     base = base != NULL ? base + 1 : value;
     if (N3DSAudio_nameLooksLikeSfx(base)) return false;
-    if (strncmp(base, "mus_", 4) == 0 || strncmp(base, "bgm_", 4) == 0) return true;
+    if (strncmp(base, "mus_", 4) == 0 || strncmp(base, "bgm_", 4) == 0 || strncmp(base, "msc_", 4) == 0) return true;
     return N3DSAudio_stringContainsIgnoreCase(base, "music");
 }
 
@@ -711,8 +711,8 @@ static bool N3DSAudio_soundLooksLikeMusic(const Sound* sound) {
 static bool N3DSAudio_pathLooksLikeBundledMusic(const char* path) {
     if (path == NULL) return false;
     if (N3DSAudio_pathStartsWith(path, "romfs:/audio/")) return false;
-    if (N3DSAudio_pathStartsWith(path, "sdmc:/3ds/cinnamon/audio/")) return false;
-    return N3DSAudio_pathStartsWith(path, "romfs:/") || N3DSAudio_pathStartsWith(path, "sdmc:/3ds/cinnamon/");
+    if (N3DSAudio_pathStartsWith(path, "sdmc:/3ds/DoodleBob/audio/")) return false;
+    return N3DSAudio_pathStartsWith(path, "romfs:/") || N3DSAudio_pathStartsWith(path, "sdmc:/3ds/DoodleBob/");
 }
 
 static bool N3DSAudio_extractBaseNameNoExt(const char* value, char* out, size_t outSize) {
@@ -1196,20 +1196,25 @@ static bool N3DSAudio_nonStreamPlaybackFinished(const N3DSSoundInstance* inst, u
     return true;
 }
 
+// Settings menu volumes: streamed sounds are the music tracks, everything else is an effect.
+static float g_musicVolume = 1.0f;
+static float g_effectsVolume = 1.0f;
+
 static void N3DSAudio_applyMix(N3DSAudioSystem* audio, N3DSSoundInstance* inst) {
     float mix[12];
     memset(mix, 0, sizeof(mix));
     inst->gain = N3DSAudio_sanitizeGain(inst->gain);
+    float level = inst->gain * audio->masterGain * (inst->isStream ? g_musicVolume : g_effectsVolume);
     if (inst->useNativeAdpcm && inst->secondaryChannelId >= 0) {
-        mix[0] = inst->gain * audio->masterGain;
+        mix[0] = level;
         ndspChnSetMix(inst->channelId, mix);
 
         memset(mix, 0, sizeof(mix));
-        mix[1] = inst->gain * audio->masterGain;
+        mix[1] = level;
         ndspChnSetMix(inst->secondaryChannelId, mix);
     } else {
-        mix[0] = inst->gain * audio->masterGain;
-        mix[1] = inst->gain * audio->masterGain;
+        mix[0] = level;
+        mix[1] = level;
         ndspChnSetMix(inst->channelId, mix);
     }
 
@@ -2814,7 +2819,11 @@ static void N3DSAudio_init(AudioSystem* base, DataWin* dataWin, FileSystem* file
     audio->backgroundPrewarmByteBudget = audio->isNew3DS ? N3DS_BACKGROUND_PREWARM_BYTE_BUDGET_NEW3DS : N3DS_BACKGROUND_PREWARM_BYTE_BUDGET_OLD3DS;
     N3DSAudio_loadPackedSoundBank(audio);
 
-    ndspInit();
+    Result ndspResult = ndspInit();
+    if (R_FAILED(ndspResult)) {
+        // Most often a missing sdmc:/3ds/dspfirm.cdc (dump it on the console with DSP1).
+        fprintf(stderr, "N3DS audio: ndspInit failed (0x%08lX); is sdmc:/3ds/dspfirm.cdc present?\n", (unsigned long) ndspResult);
+    }
     ndspSetOutputMode(NDSP_OUTPUT_STEREO);
     N3DSDebugLog_event(
         "audio",
@@ -3826,5 +3835,18 @@ void N3DSAudioSystem_getCacheStats(
     if (outTotalSounds != NULL) *outTotalSounds = audio->cachedSoundCount;
     if (outCachedBytes != NULL) *outCachedBytes = audio->cachedSoundBytes;
     if (outCacheLimitBytes != NULL) *outCacheLimitBytes = audio->maxCachedSoundBytes;
+    LightLock_Unlock(&audio->lock);
+}
+
+// Settings menu: music and effect volumes (0..1), applied to everything playing now and to what plays later.
+void N3DSAudioSystem_setVolumes(AudioSystem* base, float music, float effects) {
+    N3DSAudioSystem* audio = (N3DSAudioSystem*) base;
+    if (audio == NULL) return;
+    LightLock_Lock(&audio->lock);
+    g_musicVolume = music < 0.0f ? 0.0f : (music > 1.0f ? 1.0f : music);
+    g_effectsVolume = effects < 0.0f ? 0.0f : (effects > 1.0f ? 1.0f : effects);
+    repeat(N3DS_MAX_SOUND_INSTANCES, i) {
+        if (audio->instances[i].active) N3DSAudio_applyMix(audio, &audio->instances[i]);
+    }
     LightLock_Unlock(&audio->lock);
 }

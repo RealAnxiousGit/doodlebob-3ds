@@ -10,8 +10,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define N3DS_DEBUG_HISTORY_LOG_PATH "sdmc:/3ds/cinnamon/crash_history.log"
-#define N3DS_DEBUG_MARKER_LOG_PATH "sdmc:/3ds/cinnamon/last_breadcrumb.txt"
+#define N3DS_DEBUG_HISTORY_LOG_PATH "sdmc:/3ds/DoodleBob/crash_history.log"
+#define N3DS_DEBUG_MARKER_LOG_PATH "sdmc:/3ds/DoodleBob/last_breadcrumb.txt"
 #define N3DS_DEBUG_MARKER_BUFFER_SIZE 256
 
 static FILE* gN3DSDebugHistoryLog = NULL;
@@ -28,7 +28,7 @@ static void N3DSDebugLog_openIfNeeded(void) {
     if (gN3DSDebugStartTick == 0) gN3DSDebugStartTick = svcGetSystemTick();
 
     mkdir("sdmc:/3ds", 0777);
-    mkdir("sdmc:/3ds/cinnamon", 0777);
+    mkdir("sdmc:/3ds/DoodleBob", 0777);
 
     if (gN3DSDebugHistoryLog == NULL) {
         gN3DSDebugHistoryLog = fopen(N3DS_DEBUG_HISTORY_LOG_PATH, "a");

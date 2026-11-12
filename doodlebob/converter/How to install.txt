@@ -1,0 +1,25 @@
+DoodleBob and the Magic Pencil DX: Doodler's Cut, on 3DS
+=========================================================
+
+This folder was made by the DoodleBob 3DS Converter from your own copy of the game.
+It needs a 3DS with custom firmware (Luma3DS).
+
+1. Copy the "3ds" folder inside "SD card" to the root of your 3DS's SD card.
+   You'll end up with sdmc:/3ds/DoodleBob/ holding data.win, gfx, audio, the music files and DoodleBob.3dsx.
+   (About 290 MB. If a DoodleBob folder is already there, let it be replaced; your save, dbsave.ini,
+   and settings, settings.ini, are kept.)
+
+2. Pick one way to start the game:
+   - Home Menu icon: copy DoodleBob.cia to the SD card and install it with FBI (or another CIA installer).
+   - Homebrew Launcher: nothing to install, DoodleBob is in the list (it's DoodleBob.3dsx).
+   Either way the game data must be in sdmc:/3ds/DoodleBob.
+
+3. Sound needs the 3DS's DSP firmware at sdmc:/3ds/dspfirm.cdc. If other homebrew already has sound on
+   your 3DS, it's there. If not, run "DSP1" once from the Homebrew Launcher to dump it.
+
+Controls: stylus draws, L or R + stylus erases, D-Pad / Circle Pad move, A jumps, B / X skip text,
+START pauses. The title and pause menus have a Settings button (volume, drawing sensitivity, camera zoom).
+
+This is a fan port for personal use. DoodleBob and the Magic Pencil DX is a fangame by Ethan Wake;
+SpongeBob SquarePants belongs to Nickelodeon. Don't share these converted files: anyone who wants to play
+can make their own with the converter from their own copy of the game.

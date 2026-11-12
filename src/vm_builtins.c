@@ -306,6 +306,10 @@ static const BuiltinVarEntry BUILTIN_VAR_TABLE[] = {
     { "keyboard_lastkey", BUILTIN_VAR_KEYBOARD_LASTKEY },
     { "layer", BUILTIN_VAR_LAYER },
     { "mask_index", BUILTIN_VAR_MASK_INDEX },
+    { "mouse_button", BUILTIN_VAR_MOUSE_BUTTON },
+    { "mouse_lastbutton", BUILTIN_VAR_MOUSE_LASTBUTTON },
+    { "mouse_x", BUILTIN_VAR_MOUSE_X },
+    { "mouse_y", BUILTIN_VAR_MOUSE_Y },
     { "object_index", BUILTIN_VAR_OBJECT_INDEX },
     { "os_3ds", BUILTIN_VAR_OS_3DS },
     { "os_amazon", BUILTIN_VAR_OS_AMAZON },
@@ -419,6 +423,75 @@ void VMBuiltins_checkIfBuiltinVarTableIsSorted(void) {
 #if defined(PLATFORM_PS3)
 #include <sys/systime.h>
 #endif
+
+// ===[ Legacy global built-ins without a dedicated handler (health, lives, score, ...) ]===
+// GameMaker 1.x games use these as plain global storage. DoodleBob kills the player when health <= 0,
+// so a read that always returns 0 makes every level end on its first step.
+#define LEGACY_BUILTIN_SLOTS 32
+typedef struct {
+    const char* name; // points into the data.win string table (stable for the run)
+    bool isString;
+    GMLReal real;
+    char* string;
+} LegacyBuiltinSlot;
+static LegacyBuiltinSlot legacyBuiltinSlots[LEGACY_BUILTIN_SLOTS];
+static int32_t legacyBuiltinSlotCount = 0;
+
+static LegacyBuiltinSlot* findLegacyBuiltinSlot(const char* name, bool create) {
+    if (name == nullptr) return nullptr;
+    repeat(legacyBuiltinSlotCount, i) {
+        if (strcmp(legacyBuiltinSlots[i].name, name) == 0) return &legacyBuiltinSlots[i];
+    }
+    if (!create || legacyBuiltinSlotCount >= LEGACY_BUILTIN_SLOTS) return nullptr;
+    static const char* const globalNames[] = {
+        "health", "lives", "score", "room_caption", "show_score", "show_lives", "show_health",
+        "caption_score", "caption_lives", "caption_health", "error_occurred", "error_last",
+    };
+    bool known = false;
+    repeat(sizeof(globalNames) / sizeof(globalNames[0]), i) {
+        if (strcmp(globalNames[i], name) == 0) { known = true; break; }
+    }
+    if (!known) return nullptr;
+    LegacyBuiltinSlot* slot = &legacyBuiltinSlots[legacyBuiltinSlotCount++];
+    memset(slot, 0, sizeof(*slot));
+    slot->name = name;
+    // GameMaker's defaults: health starts at 100, lives at -1, everything else at 0.
+    if (strcmp(name, "health") == 0) slot->real = 100.0;
+    else if (strcmp(name, "lives") == 0) slot->real = -1.0;
+    return slot;
+}
+
+static bool legacyBuiltinRead(const char* name, int32_t arrayIndex, RValue* out) {
+    if (arrayIndex > 0) return false;
+    LegacyBuiltinSlot* slot = findLegacyBuiltinSlot(name, true);
+    if (slot == nullptr) return false;
+    *out = slot->isString ? RValue_makeOwnedString(safeStrdup(slot->string != nullptr ? slot->string : "")) : RValue_makeReal(slot->real);
+    return true;
+}
+
+// Read access for native code (the 3DS HUD reads health and lives).
+bool VMBuiltins_getLegacyGlobalReal(const char* name, GMLReal* out) {
+    repeat(legacyBuiltinSlotCount, i) {
+        if (strcmp(legacyBuiltinSlots[i].name, name) == 0 && !legacyBuiltinSlots[i].isString) {
+            *out = legacyBuiltinSlots[i].real;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool legacyBuiltinWrite(const char* name, int32_t arrayIndex, RValue val) {
+    if (arrayIndex > 0) return false;
+    LegacyBuiltinSlot* slot = findLegacyBuiltinSlot(name, true);
+    if (slot == nullptr) return false;
+    free(slot->string);
+    slot->string = nullptr;
+    slot->isString = val.type == RVALUE_STRING;
+    if (slot->isString) slot->string = safeStrdup(val.string != nullptr ? val.string : "");
+    else slot->real = RValue_toReal(val);
+    return true;
+}
+
 RValue VMBuiltins_getVariable(VMContext* ctx, int16_t builtinVarId, const char* name, int32_t arrayIndex) {
     Instance* inst = (Instance*) ctx->currentInstance;
     Runner* runner = (Runner*) ctx->runner;
@@ -837,6 +910,18 @@ RValue VMBuiltins_getVariable(VMContext* ctx, int16_t builtinVarId, const char* 
         case BUILTIN_VAR_KEYBOARD_LASTKEY:
             return RValue_makeReal((GMLReal) runner->keyboard->lastKey);
 
+        // Mouse
+        case BUILTIN_VAR_MOUSE_BUTTON:
+            return RValue_makeReal((GMLReal) RunnerMouse_getButton(runner->mouse));
+        case BUILTIN_VAR_MOUSE_LASTBUTTON:
+            return RValue_makeReal((GMLReal) RunnerMouse_getLastButton(runner->mouse));
+        case BUILTIN_VAR_MOUSE_X:
+        case BUILTIN_VAR_MOUSE_Y: {
+            GMLReal mouseRoomX, mouseRoomY;
+            Runner_getMouseRoomPosition(runner, &mouseRoomX, &mouseRoomY);
+            return RValue_makeReal(builtinVarId == BUILTIN_VAR_MOUSE_X ? mouseRoomX : mouseRoomY);
+        }
+
         // Surfaces
         case BUILTIN_VAR_APPLICATION_SURFACE:
             return RValue_makeReal(-1.0); // sentinel ID for the application surface
@@ -960,6 +1045,11 @@ RValue VMBuiltins_getVariable(VMContext* ctx, int16_t builtinVarId, const char* 
             break;
     }
 
+    if (inst != nullptr && name != nullptr && strcmp(name, "image_single") == 0) {
+        return RValue_makeReal(inst->imageSpeed == 0.0f ? (GMLReal) inst->imageIndex : -1.0);
+    }
+    RValue legacy;
+    if (legacyBuiltinRead(name, arrayIndex, &legacy)) return legacy;
     fprintf(stderr, "VM: [%s] Unhandled built-in variable read '%s' (arrayIndex=%d)\n", ctx->currentCodeName, name, arrayIndex);
     return RValue_makeReal(0.0);
 }
@@ -1326,6 +1416,18 @@ void VMBuiltins_setVariable(VMContext* ctx, int16_t builtinVarId, const char* na
             break;
     }
 
+    // GM8 image_single: n >= 0 shows frame n and stops animating, -1 animates again.
+    if (inst != nullptr && name != nullptr && strcmp(name, "image_single") == 0) {
+        GMLReal frame = RValue_toReal(val);
+        if (frame >= 0) {
+            inst->imageIndex = (float) frame;
+            inst->imageSpeed = 0.0f;
+        } else {
+            inst->imageSpeed = 1.0f;
+        }
+        return;
+    }
+    if (legacyBuiltinWrite(name, arrayIndex, val)) return;
     fprintf(stderr, "VM: [%s] Unhandled built-in variable write '%s' (arrayIndex=%d)\n", ctx->currentCodeName, name, arrayIndex);
 }
 
@@ -4039,6 +4141,32 @@ static RValue builtinArrayDelete(MAYBE_UNUSED VMContext* ctx, RValue* args, int3
 
 // ===[ COLLISION FUNCTIONS]===
 
+// Finds whether the caller (already moved to its test position, bbox given) overlaps any active instance,
+// solid ones only when solidOnly. Uses the spatial grid instead of scanning every instance (DoodleBob levels
+// have ~1,400 instances and call place_free dozens of times per step).
+static bool gridAnyOverlap(Runner* runner, Instance* caller, InstanceBBox callerBBox, bool solidOnly) {
+    if (!callerBBox.valid) return false;
+    SpatialGrid_syncGrid(runner, runner->spatialGrid);
+    SpatialGridQuery query = SpatialGrid_prepareQuery(runner, callerBBox.left, callerBBox.top, callerBBox.right, callerBBox.bottom, INSTANCE_ALL);
+    for (int32_t gx = query.range.minGridX; query.range.maxGridX >= gx; gx++) {
+        for (int32_t gy = query.range.minGridY; query.range.maxGridY >= gy; gy++) {
+            Instance** cell = runner->spatialGrid->grid[SpatialGrid_cellIndex(runner->spatialGrid, gx, gy)];
+            int32_t cellLen = (int32_t) arrlen(cell);
+            repeat(cellLen, ci) {
+                Instance* other = cell[ci];
+                if (!other->active || other == caller) continue;
+                if (solidOnly && !other->solid) continue;
+                if (other->lastCollisionQueryId == query.queryId) continue;
+                other->lastCollisionQueryId = query.queryId;
+                InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
+                if (!otherBBox.valid) continue;
+                if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 static RValue builtinPlaceFree(VMContext* ctx, RValue* args, int32_t argCount) {
     if (2 > argCount) return RValue_makeBool(true);
 
@@ -4058,21 +4186,7 @@ static RValue builtinPlaceFree(VMContext* ctx, RValue* args, int32_t argCount) {
     InstanceBBox callerBBox = Collision_computeBBox(runner->dataWin, caller);
     bool free = true;
 
-    if (callerBBox.valid) {
-        int32_t instanceCount = (int32_t) arrlen(runner->instances);
-        repeat(instanceCount, i) {
-            Instance* other = runner->instances[i];
-            if (!other->active || !other->solid || other == caller) continue;
-
-            InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
-            if (!otherBBox.valid) continue;
-
-            if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
-                free = false;
-                break;
-            }
-        }
-    }
+    free = !gridAnyOverlap(runner, caller, callerBBox, true);
 
     // Restore original position
     caller->x = savedX;
@@ -4091,21 +4205,7 @@ static bool placeEmptyAt(Runner* runner, Instance* caller, GMLReal testX, GMLRea
     InstanceBBox callerBBox = Collision_computeBBox(runner->dataWin, caller);
     bool empty = true;
 
-    if (callerBBox.valid) {
-        int32_t instanceCount = (int32_t) arrlen(runner->instances);
-        repeat(instanceCount, i) {
-            Instance* other = runner->instances[i];
-            if (!other->active || other == caller) continue;
-
-            InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
-            if (!otherBBox.valid) continue;
-
-            if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
-                empty = false;
-                break;
-            }
-        }
-    }
+    empty = !gridAnyOverlap(runner, caller, callerBBox, false);
 
     caller->x = savedX;
     caller->y = savedY;
@@ -4122,21 +4222,7 @@ static bool placeFreeAt(Runner* runner, Instance* caller, GMLReal testX, GMLReal
     InstanceBBox callerBBox = Collision_computeBBox(runner->dataWin, caller);
     bool free = true;
 
-    if (callerBBox.valid) {
-        int32_t instanceCount = (int32_t) arrlen(runner->instances);
-        repeat(instanceCount, i) {
-            Instance* other = runner->instances[i];
-            if (!other->active || !other->solid || other == caller) continue;
-
-            InstanceBBox otherBBox = Collision_computeBBox(runner->dataWin, other);
-            if (!otherBBox.valid) continue;
-
-            if (Collision_instancesOverlapPrecise(runner->dataWin, runner->collisionCompatibilityMode, caller, other, callerBBox, otherBBox)) {
-                free = false;
-                break;
-            }
-        }
-    }
+    free = !gridAnyOverlap(runner, caller, callerBBox, true);
 
     caller->x = savedX;
     caller->y = savedY;
@@ -5625,6 +5711,9 @@ static RValue builtinGameRestart(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYB
 
 static RValue builtinGameEnd(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = (Runner*) ctx->runner;
+    Instance* caller = (Instance*) ctx->currentInstance;
+    fprintf(stderr, "game_end called by %s (event type %d) in room %ld\n",
+        caller != nullptr ? runner->dataWin->objt.objects[caller->objectIndex].name : "?", (int) ctx->currentEventType, (long) runner->currentRoomIndex);
     runner->shouldExit = true;
     return RValue_makeUndefined();
 }
@@ -10353,6 +10442,322 @@ static RValue builtinGpuSetColorWriteEnable(VMContext* ctx, RValue* args, int32_
 
 // ===[ REGISTRATION ]===
 
+// ===[ DoodleBob port: functions backported from upstream main or added for this game ]===
+
+// --- Mouse ---
+static RValue builtinMouseCheckButton(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeBool(false);
+    return RValue_makeBool(RunnerMouse_checkButton(ctx->runner->mouse, RValue_toInt32(args[0])));
+}
+
+static RValue builtinMouseCheckButtonPressed(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeBool(false);
+    return RValue_makeBool(RunnerMouse_checkButtonPressed(ctx->runner->mouse, RValue_toInt32(args[0])));
+}
+
+static RValue builtinMouseCheckButtonReleased(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeBool(false);
+    return RValue_makeBool(RunnerMouse_checkButtonReleased(ctx->runner->mouse, RValue_toInt32(args[0])));
+}
+
+static RValue builtinMouseClear(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    RunnerMouse_clear(ctx->runner->mouse, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+// Only device 0 (the stylus) exists.
+static RValue builtinDeviceMouseCheckButton(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount || RValue_toInt32(args[0]) != 0) return RValue_makeBool(false);
+    return RValue_makeBool(RunnerMouse_checkButton(ctx->runner->mouse, RValue_toInt32(args[1])));
+}
+
+static RValue builtinDeviceMouseX(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount || RValue_toInt32(args[0]) != 0) return RValue_makeReal(0.0);
+    GMLReal mx, my;
+    Runner_getMouseRoomPosition(ctx->runner, &mx, &my);
+    return RValue_makeReal(mx);
+}
+
+static RValue builtinDeviceMouseY(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount || RValue_toInt32(args[0]) != 0) return RValue_makeReal(0.0);
+    GMLReal mx, my;
+    Runner_getMouseRoomPosition(ctx->runner, &mx, &my);
+    return RValue_makeReal(my);
+}
+
+// io_clear(): forget all held/pressed/released keys and mouse buttons.
+static RValue builtinIoClear(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+    for (int32_t key = 0; GML_KEY_COUNT > key; key++) RunnerKeyboard_clear(runner->keyboard, key);
+    RunnerMouse_clear(runner->mouse, GML_MB_ANY);
+    return RValue_makeUndefined();
+}
+
+// The game draws its own cursor sprite; there is no OS cursor on 3DS.
+static RValue builtinWindowSetCursor(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeUndefined();
+}
+
+// virtual_key_add only runs in the game's Android mode, which this port leaves off. Return a valid-looking id.
+static RValue builtinVirtualKeyAdd(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    static int32_t nextVirtualKeyId = 0;
+    return RValue_makeReal((GMLReal) nextVirtualKeyId++);
+}
+
+// --- Instance regions ---
+static bool regionInstanceOutside(Runner* runner, Instance* inst, GMLReal left, GMLReal top, GMLReal right, GMLReal bottom) {
+    Sprite* spr = Collision_getSprite(runner->dataWin, inst);
+    if (spr != nullptr) {
+        InstanceBBox bbox = Collision_computeBBox(runner->dataWin, inst);
+        if (bbox.valid) return bbox.right < left || bbox.left > right || bbox.bottom < top || bbox.top > bottom;
+    }
+    return inst->x > right || left > inst->x || inst->y > bottom || top > inst->y;
+}
+
+static RValue builtinInstanceActivateRegion(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (5 > argCount) return RValue_makeUndefined();
+    Runner* runner = ctx->runner;
+    GMLReal left = RValue_toReal(args[0]);
+    GMLReal top = RValue_toReal(args[1]);
+    GMLReal right = left + RValue_toReal(args[2]) - 1;
+    GMLReal bottom = top + RValue_toReal(args[3]) - 1;
+    bool wantInside = RValue_toBool(args[4]);
+    int32_t count = (int32_t) arrlen(runner->instances);
+    repeat(count, i) {
+        Instance* inst = runner->instances[i];
+        if (inst->active || inst->destroyed) continue;
+        if (regionInstanceOutside(runner, inst, left, top, right, bottom) != wantInside) inst->active = true;
+    }
+    return RValue_makeUndefined();
+}
+
+static RValue builtinInstanceDeactivateRegion(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (5 > argCount) return RValue_makeUndefined();
+    Runner* runner = ctx->runner;
+    GMLReal left = RValue_toReal(args[0]);
+    GMLReal top = RValue_toReal(args[1]);
+    GMLReal right = left + RValue_toReal(args[2]) - 1;
+    GMLReal bottom = top + RValue_toReal(args[3]) - 1;
+    bool wantInside = RValue_toBool(args[4]);
+    bool notme = argCount > 5 ? RValue_toBool(args[5]) : false;
+    Instance* self = ctx->currentInstance;
+    int32_t count = (int32_t) arrlen(runner->instances);
+    repeat(count, i) {
+        Instance* inst = runner->instances[i];
+        if (!inst->active || inst->destroyed) continue;
+        if (notme && inst == self) continue;
+        if (regionInstanceOutside(runner, inst, left, top, right, bottom) != wantInside) inst->active = false;
+    }
+    return RValue_makeUndefined();
+}
+
+// --- Motion ---
+static bool motionTestFree(Runner* runner, Instance* inst, GMLReal testX, GMLReal testY, bool useall) {
+    return useall ? placeEmptyAt(runner, inst, testX, testY) : placeFreeAt(runner, inst, testX, testY);
+}
+
+static void moveBounceCommon(Runner* runner, Instance* inst, bool advanced, bool useall) {
+    bool didBounce = false;
+    if (!motionTestFree(runner, inst, inst->x, inst->y, useall)) {
+        inst->x = inst->xprevious;
+        inst->y = inst->yprevious;
+        SpatialGrid_markInstanceAsDirty(runner->spatialGrid, inst);
+        didBounce = true;
+    }
+    GMLReal xx = inst->x;
+    GMLReal yy = inst->y;
+    if (advanced) {
+        int32_t n = 18;
+        GMLReal dir = 10.0 * GMLReal_round(inst->direction / 10.0);
+        GMLReal ldir = dir;
+        GMLReal rdir = dir;
+        for (int32_t i = 1; 2 * n > i; i++) {
+            ldir -= 180.0 / (GMLReal) n;
+            if (motionTestFree(runner, inst, xx + inst->speed * GMLReal_cos(ldir * (M_PI / 180.0)), yy - inst->speed * GMLReal_sin(ldir * (M_PI / 180.0)), useall)) break;
+            didBounce = true;
+        }
+        for (int32_t i = 1; 2 * n > i; i++) {
+            rdir += 180.0 / (GMLReal) n;
+            if (motionTestFree(runner, inst, xx + inst->speed * GMLReal_cos(rdir * (M_PI / 180.0)), yy - inst->speed * GMLReal_sin(rdir * (M_PI / 180.0)), useall)) break;
+            didBounce = true;
+        }
+        if (didBounce) {
+            inst->direction = (float) (180.0 + (ldir + rdir) - dir);
+            Instance_computeComponentsFromSpeed(inst);
+        }
+    } else {
+        bool canMoveH = motionTestFree(runner, inst, inst->x + inst->hspeed, inst->y, useall);
+        bool canMoveV = motionTestFree(runner, inst, inst->x, inst->y + inst->vspeed, useall);
+        bool canMoveDiagonally = motionTestFree(runner, inst, inst->x + inst->hspeed, inst->y + inst->vspeed, useall);
+        if ((!canMoveH && !canMoveV) || (canMoveH && canMoveV && !canMoveDiagonally)) {
+            inst->hspeed = -inst->hspeed;
+            inst->vspeed = -inst->vspeed;
+        } else if (!canMoveH) {
+            inst->hspeed = -inst->hspeed;
+        } else if (!canMoveV) {
+            inst->vspeed = -inst->vspeed;
+        }
+        Instance_computeSpeedFromComponents(inst);
+    }
+}
+
+// Steps up to maxdist pixels in dir (degrees), stopping before a collision. Does nothing if already colliding.
+static void moveContactCommon(Runner* runner, Instance* inst, GMLReal dir, GMLReal maxdist, bool useall) {
+    int32_t steps = (maxdist <= 0.0) ? 1000 : (int32_t) rint((double) maxdist);
+    GMLReal rad = dir * (M_PI / 180.0);
+    GMLReal dx = GMLReal_cos(rad);
+    GMLReal dy = -GMLReal_sin(rad);
+    if (!motionTestFree(runner, inst, inst->x, inst->y, useall)) return;
+    for (int32_t i = 1; steps >= i; i++) {
+        GMLReal nx = inst->x + dx;
+        GMLReal ny = inst->y + dy;
+        if (!motionTestFree(runner, inst, nx, ny, useall)) break;
+        inst->x = (float) nx;
+        inst->y = (float) ny;
+    }
+    SpatialGrid_markInstanceAsDirty(runner->spatialGrid, inst);
+}
+
+static RValue builtinMoveBounceSolid(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount || ctx->currentInstance == nullptr) return RValue_makeUndefined();
+    moveBounceCommon(ctx->runner, ctx->currentInstance, RValue_toBool(args[0]), false);
+    return RValue_makeUndefined();
+}
+
+static RValue builtinMoveContactSolid(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount || ctx->currentInstance == nullptr) return RValue_makeUndefined();
+    moveContactCommon(ctx->runner, ctx->currentInstance, RValue_toReal(args[0]), RValue_toReal(args[1]), false);
+    return RValue_makeUndefined();
+}
+
+// Legacy move_contact(dir): no distance limit. Every ground object in DoodleBob is solid, so the solid test is used.
+static RValue builtinMoveContact(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount || ctx->currentInstance == nullptr) return RValue_makeUndefined();
+    moveContactCommon(ctx->runner, ctx->currentInstance, RValue_toReal(args[0]), -1.0, false);
+    return RValue_makeUndefined();
+}
+
+static RValue builtinMoveWrap(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount || ctx->currentInstance == nullptr) return RValue_makeUndefined();
+    bool hor = RValue_toBool(args[0]);
+    bool vert = RValue_toBool(args[1]);
+    GMLReal margin = RValue_toReal(args[2]);
+    Instance* inst = ctx->currentInstance;
+    Room* room = ctx->runner->currentRoom;
+    if (hor) {
+        if (inst->x < -margin) inst->x = (float) (inst->x + room->width + 2 * margin);
+        else if (inst->x > room->width + margin) inst->x = (float) (inst->x - room->width - 2 * margin);
+    }
+    if (vert) {
+        if (inst->y < -margin) inst->y = (float) (inst->y + room->height + 2 * margin);
+        else if (inst->y > room->height + margin) inst->y = (float) (inst->y - room->height - 2 * margin);
+    }
+    SpatialGrid_markInstanceAsDirty(ctx->runner->spatialGrid, inst);
+    return RValue_makeUndefined();
+}
+
+// --- Sprites ---
+static RValue builtinSpriteGetBboxTop(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeReal(0.0);
+    int32_t spriteIndex = RValue_toInt32(args[0]);
+    if (0 > spriteIndex || (uint32_t) spriteIndex >= ctx->dataWin->sprt.count) return RValue_makeReal(0.0);
+    return RValue_makeReal((GMLReal) ctx->dataWin->sprt.sprites[spriteIndex].marginTop);
+}
+
+static RValue builtinSpriteGetBboxBottom(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeReal(0.0);
+    int32_t spriteIndex = RValue_toInt32(args[0]);
+    if (0 > spriteIndex || (uint32_t) spriteIndex >= ctx->dataWin->sprt.count) return RValue_makeReal(0.0);
+    return RValue_makeReal((GMLReal) ctx->dataWin->sprt.sprites[spriteIndex].marginBottom);
+}
+
+// --- Legacy sound_* (GameMaker 8 style), mapped onto the audio system ---
+static RValue builtinSoundPlayCommon(VMContext* ctx, RValue* args, int32_t argCount, bool loop) {
+    AudioSystem* audio = getAudioSystem(ctx);
+    if (audio == nullptr || 1 > argCount || args[0].type == RVALUE_UNDEFINED) return RValue_makeReal(-1.0);
+    int32_t soundIndex = RValue_toInt32(args[0]);
+    // Legacy sounds have one voice each: restarting replaces the old one.
+    audio->vtable->stopSound(audio, soundIndex);
+    return RValue_makeReal((GMLReal) audio->vtable->playSound(audio, soundIndex, 10, loop));
+}
+
+static RValue builtinSoundPlay(VMContext* ctx, RValue* args, int32_t argCount) { return builtinSoundPlayCommon(ctx, args, argCount, false); }
+static RValue builtinSoundLoop(VMContext* ctx, RValue* args, int32_t argCount) { return builtinSoundPlayCommon(ctx, args, argCount, true); }
+
+static RValue builtinSoundStop(VMContext* ctx, RValue* args, int32_t argCount) {
+    AudioSystem* audio = getAudioSystem(ctx);
+    if (audio == nullptr || 1 > argCount) return RValue_makeUndefined();
+    audio->vtable->stopSound(audio, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtinSoundStopAll(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    AudioSystem* audio = getAudioSystem(ctx);
+    if (audio == nullptr) return RValue_makeUndefined();
+    audio->vtable->stopAll(audio);
+    ctx->runner->lastMusicInstance = -1;
+    return RValue_makeUndefined();
+}
+
+static RValue builtinSoundIsPlaying(VMContext* ctx, RValue* args, int32_t argCount) {
+    AudioSystem* audio = getAudioSystem(ctx);
+    if (audio == nullptr || 1 > argCount) return RValue_makeBool(false);
+    return RValue_makeBool(audio->vtable->isPlaying(audio, RValue_toInt32(args[0])));
+}
+
+static RValue builtinSoundVolume(VMContext* ctx, RValue* args, int32_t argCount) {
+    AudioSystem* audio = getAudioSystem(ctx);
+    if (audio == nullptr || 2 > argCount) return RValue_makeUndefined();
+    audio->vtable->setSoundGain(audio, RValue_toInt32(args[0]), (float) RValue_toReal(args[1]), 0);
+    return RValue_makeUndefined();
+}
+
+static RValue builtinSoundGlobalVolume(VMContext* ctx, RValue* args, int32_t argCount) {
+    AudioSystem* audio = getAudioSystem(ctx);
+    if (audio == nullptr || 1 > argCount) return RValue_makeUndefined();
+    float gain = (float) RValue_toReal(args[0]);
+#ifdef __3DS__
+    // DoodleBob calls sound_global_volume(0.75) once at boot. The 3DS preprocessor already levels every sound for
+    // playback at full volume (music -11 LUFS, effects at most -9), so that 0.75 counts as full volume here.
+    gain /= 0.75f;
+    if (gain > 1.0f) gain = 1.0f;
+#endif
+    audio->vtable->setMasterGain(audio, gain);
+    return RValue_makeUndefined();
+}
+
+// Registers only names the branch doesn't already provide (VM_registerBuiltin aborts on duplicates).
+#define VM_registerBuiltin(ctx, name, func) do { if (VM_findBuiltin((ctx), (name)) == nullptr) VM_registerBuiltin((ctx), (name), (func)); } while (0)
+static void registerDoodleBobPortBuiltins(VMContext* ctx) {
+    VM_registerBuiltin(ctx, "mouse_check_button", builtinMouseCheckButton);
+    VM_registerBuiltin(ctx, "mouse_check_button_pressed", builtinMouseCheckButtonPressed);
+    VM_registerBuiltin(ctx, "mouse_check_button_released", builtinMouseCheckButtonReleased);
+    VM_registerBuiltin(ctx, "mouse_clear", builtinMouseClear);
+    VM_registerBuiltin(ctx, "device_mouse_check_button", builtinDeviceMouseCheckButton);
+    VM_registerBuiltin(ctx, "device_mouse_x", builtinDeviceMouseX);
+    VM_registerBuiltin(ctx, "device_mouse_y", builtinDeviceMouseY);
+    VM_registerBuiltin(ctx, "io_clear", builtinIoClear);
+    VM_registerBuiltin(ctx, "window_set_cursor", builtinWindowSetCursor);
+    VM_registerBuiltin(ctx, "virtual_key_add", builtinVirtualKeyAdd);
+    VM_registerBuiltin(ctx, "instance_activate_region", builtinInstanceActivateRegion);
+    VM_registerBuiltin(ctx, "instance_deactivate_region", builtinInstanceDeactivateRegion);
+    VM_registerBuiltin(ctx, "move_bounce_solid", builtinMoveBounceSolid);
+    VM_registerBuiltin(ctx, "move_contact_solid", builtinMoveContactSolid);
+    VM_registerBuiltin(ctx, "move_contact", builtinMoveContact);
+    VM_registerBuiltin(ctx, "move_wrap", builtinMoveWrap);
+    VM_registerBuiltin(ctx, "sprite_get_bbox_top", builtinSpriteGetBboxTop);
+    VM_registerBuiltin(ctx, "sprite_get_bbox_bottom", builtinSpriteGetBboxBottom);
+    VM_registerBuiltin(ctx, "sound_play", builtinSoundPlay);
+    VM_registerBuiltin(ctx, "sound_loop", builtinSoundLoop);
+    VM_registerBuiltin(ctx, "sound_stop", builtinSoundStop);
+    VM_registerBuiltin(ctx, "sound_stop_all", builtinSoundStopAll);
+    VM_registerBuiltin(ctx, "sound_isplaying", builtinSoundIsPlaying);
+    VM_registerBuiltin(ctx, "sound_volume", builtinSoundVolume);
+    VM_registerBuiltin(ctx, "sound_global_volume", builtinSoundGlobalVolume);
+}
+#undef VM_registerBuiltin
+
 void VMBuiltins_registerAll(VMContext* ctx) {
     requireMessage(!ctx->registeredBuiltinFunctions, "Attempting to register all VMBuiltins, but it was already registered!");
     ctx->registeredBuiltinFunctions = true;
@@ -10964,6 +11369,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx,"gpu_set_colorwriteenable", builtinGpuSetColorWriteEnable);
     VM_registerBuiltin(ctx,"gpu_set_fog", builtinGpuSetFog);
     VM_registerBuiltin(ctx,"d3d_set_fog", builtinGpuSetFog);
+
+    registerDoodleBobPortBuiltins(ctx);
 }
 
 static RValue builtinN3DSRenderTopScreen(VMContext* ctx, RValue* args, int32_t argCount) {
