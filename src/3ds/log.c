@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 
-#define N3DS_LOG_PATH "sdmc:/3ds/cinnamon/runner_log.txt"
+#define N3DS_LOG_PATH "sdmc:/3ds/DoodleBob/runner_log.txt"
 #define N3DS_LOG_BUFFER_SIZE 1024
 
 static FILE* gLogFile;
@@ -24,7 +24,7 @@ static void n3ds_logOpenIfNeeded(bool truncate) {
     if (gLogFile != NULL) return;
 
     mkdir("sdmc:/3ds", 0777);
-    mkdir("sdmc:/3ds/cinnamon", 0777);
+    mkdir("sdmc:/3ds/DoodleBob", 0777);
     gLogFile = fopen(N3DS_LOG_PATH, truncate ? "w" : "a");
     if (gLogFile != NULL) {
         // keep the last complete event on the sd card after a hard freeze.

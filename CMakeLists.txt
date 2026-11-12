@@ -1221,6 +1221,15 @@ elseif(PLATFORM STREQUAL "3ds")
     set(N3DS_HOST_TOOLS_DIR ${CMAKE_CURRENT_BINARY_DIR}/host-tools)
     file(MAKE_DIRECTORY ${N3DS_GENERATED_DIR})
 
+    # DoodleBob: the "Ported by NickBin" intro logo, compiled into the program from resources/3ds.
+    set(DB_LOGO_PNG ${N3DS_RESOURCE_ROOT}/ported_by_nickbin.png)
+    set(DB_LOGO_C ${N3DS_GENERATED_DIR}/db_logo_png.c)
+    file(READ ${DB_LOGO_PNG} DB_LOGO_HEX HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," DB_LOGO_BYTES "${DB_LOGO_HEX}")
+    file(WRITE ${DB_LOGO_C} "#include <stddef.h>\nconst unsigned char db_logo_png[] = {${DB_LOGO_BYTES}};\nconst size_t db_logo_png_size = sizeof(db_logo_png);\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${DB_LOGO_PNG})
+    target_sources(butterscotch PRIVATE ${DB_LOGO_C} src/image/image_decoder.c)
+
     find_program(CTR_PICASSO picasso HINTS ${DEVKITPRO_ROOT}/tools/bin)
     find_program(CTR_TEX3DS tex3ds HINTS ${DEVKITPRO_ROOT}/tools/bin)
     find_program(CTR_3DSXTOOL 3dsxtool HINTS ${DEVKITPRO_ROOT}/tools/bin)

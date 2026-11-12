@@ -398,6 +398,17 @@ typedef struct {
     bool screenTransformActive;
     bool hostViewProjectionActive;
     N3DSRenderStateSnapshot* targetStack;
+    // DoodleBob: two-screen draw passes and stereo 3D.
+    C3D_RenderTarget* currentHostTarget;
+    bool passActive;
+    uint8_t passScreen;
+    float passScale;
+    float passOffX;
+    float passOffY;
+    uint8_t passClearedMask;
+    C3D_RenderTarget* rightTarget;
+    bool stereoOn;
+    int32_t layerSurfaceId;
 } N3DSRenderer;
 
 struct N3DSRenderStateSnapshot {
@@ -2273,6 +2284,16 @@ static bool C3D_resolveTextureRegion(
 }
 
 static void C3D_bindTarget(N3DSRenderer* renderer, int32_t surfaceId, bool bottomScreen) {
+    if (surfaceId == RENDER_TARGET_HOST_FRAMEBUFFER && renderer->passActive) {
+        // A pass owns the "screen": surface_reset_target and friends come back to it.
+        if (renderer->passScreen == C3D_DB_SCREEN_LAYER && renderer->layerSurfaceId >= 0 &&
+            (uint32_t)renderer->layerSurfaceId < renderer->surfaceCount &&
+            renderer->surfaces[renderer->layerSurfaceId].used) {
+            surfaceId = renderer->layerSurfaceId;
+        } else {
+            bottomScreen = renderer->passScreen == C3D_DB_SCREEN_BOTTOM;
+        }
+    }
 #if !N3DS_HAS_BOTTOM_TARGET
     bottomScreen = false;
 #endif
@@ -2302,9 +2323,12 @@ static void C3D_bindTarget(N3DSRenderer* renderer, int32_t surfaceId, bool botto
     }
 
     C3D_RenderTarget* target = bottomScreen ? renderer->bottomTarget : renderer->topTarget;
+    if (!bottomScreen && renderer->passActive && renderer->passScreen == C3D_DB_SCREEN_TOP_RIGHT &&
+        renderer->rightTarget != NULL)
+        target = renderer->rightTarget;
     if (target == NULL) return;
     bool sameTarget = renderer->currentTargetSurfaceId == RENDER_TARGET_HOST_FRAMEBUFFER &&
-        renderer->currentHostTargetIsBottomScreen == bottomScreen;
+        renderer->currentHostTarget == target;
     n3ds_c3dFlush(&renderer->drawContext);
     renderer->hostViewProjectionActive = false;
     if (!sameTarget && renderer->currentTargetSurfaceId != INT32_MIN &&
@@ -2316,6 +2340,7 @@ static void C3D_bindTarget(N3DSRenderer* renderer, int32_t surfaceId, bool botto
     }
     renderer->currentTargetSurfaceId = RENDER_TARGET_HOST_FRAMEBUFFER;
     renderer->currentHostTargetIsBottomScreen = bottomScreen;
+    renderer->currentHostTarget = target;
     C3D_setHostViewport(renderer);
     C3D_applyBlendState(renderer);
 }
@@ -2330,7 +2355,7 @@ static void C3D_getHostViewport(const N3DSRenderer* renderer, int32_t portX,
     int32_t hostH = renderer->currentHostTargetIsBottomScreen
                         ? N3DS_BOTTOM_HEIGHT
                         : N3DS_TOP_HEIGHT;
-    if (renderer->frameGameW <= 0 || renderer->frameGameH <= 0) {
+    if (renderer->frameGameW <= 0 || renderer->frameGameH <= 0 || renderer->passActive) {
         *outX = portX;
         *outY = portY;
         *outW = portW;
@@ -5373,6 +5398,13 @@ static bool C3D_shadersSupported(void) {
 static void C3D_clearActive(Renderer* base, uint32_t color, float alpha) {
     assert(base != NULL);
     N3DSRenderer* renderer = (N3DSRenderer*)base;
+    if (renderer->passActive &&
+        (renderer->currentTargetSurfaceId == RENDER_TARGET_HOST_FRAMEBUFFER ||
+            renderer->currentTargetSurfaceId == renderer->layerSurfaceId)) {
+        uint8_t bit = (uint8_t)(1u << renderer->passScreen);
+        if (renderer->passClearedMask & bit) return;
+        renderer->passClearedMask |= bit;
+    }
     C3D_safeFrameSplit(renderer);
     if (renderer->currentTargetSurfaceId >= 0 &&
         (uint32_t)renderer->currentTargetSurfaceId < renderer->surfaceCount &&
@@ -5383,11 +5415,11 @@ static void C3D_clearActive(Renderer* base, uint32_t color, float alpha) {
             renderer->surfaces[renderer->currentTargetSurfaceId].target, C3D_CLEAR_ALL, rgba, 0);
     } else {
         uint32_t rgba = C3D_makeClearColor(color, alpha);
-        C3D_RenderTargetClear(
-            renderer->currentHostTargetIsBottomScreen
-                ? renderer->bottomTarget
-                : renderer->topTarget,
-            C3D_CLEAR_ALL, rgba, 0);
+        C3D_RenderTarget* hostTarget = renderer->currentHostTarget;
+        if (hostTarget == NULL)
+            hostTarget = renderer->currentHostTargetIsBottomScreen ? renderer->bottomTarget
+                                                                   : renderer->topTarget;
+        C3D_RenderTargetClear(hostTarget, C3D_CLEAR_ALL, rgba, 0);
     }
 }
 
@@ -5466,6 +5498,7 @@ static void C3D_destroy(Renderer* base) {
     C3D_destroyAtlas(renderer);
     C3D_destroyRoomManifest(renderer);
     if (renderer->topTarget != NULL) C3D_RenderTargetDelete(renderer->topTarget);
+    if (renderer->rightTarget != NULL) C3D_RenderTargetDelete(renderer->rightTarget);
     if (renderer->bottomTarget != NULL) C3D_RenderTargetDelete(renderer->bottomTarget);
     if (renderer->drawContextReady) n3ds_c3dDestroy(&renderer->drawContext);
     free(renderer);
@@ -5479,7 +5512,12 @@ static void C3D_beginFrame(Renderer* base, int32_t gameW, int32_t gameH,
     if (renderer->frameCounter == 0u) renderer->frameCounter = 1u;
     renderer->currentTargetSurfaceId = INT32_MIN;
     renderer->currentHostTargetIsBottomScreen = false;
+    renderer->currentHostTarget = NULL;
+    renderer->passActive = false;
+    renderer->passClearedMask = 0;
     C3D_invalidateViewportCache(renderer);
+    if (renderer->stereoOn && renderer->rightTarget != NULL)
+        C3D_RenderTargetClear(renderer->rightTarget, C3D_CLEAR_ALL, n3ds_c3dClearColor(0, 0, 0, 255), 0);
     renderer->frameGameW = gameW;
     renderer->frameGameH = gameH;
     renderer->bottomScreenUsedThisFrame = false;
@@ -5592,8 +5630,46 @@ static void C3D_beginView(Renderer* base, int32_t viewX, int32_t viewY, int32_t 
     assert(base != NULL);
     N3DSRenderer* renderer = (N3DSRenderer*)base;
     renderer->hostViewProjectionActive = false;
+    if (renderer->passActive &&
+        (renderer->currentTargetSurfaceId == RENDER_TARGET_HOST_FRAMEBUFFER ||
+            (renderer->currentTargetSurfaceId == renderer->layerSurfaceId &&
+                renderer->layerSurfaceId >= 0))) {
+        float s = renderer->passScale;
+        float x0 = renderer->passOffX + (float)portX * s;
+        float y0 = renderer->passOffY + (float)portY * s;
+        float x1 = renderer->passOffX + (float)(portX + portW) * s;
+        float y1 = renderer->passOffY + (float)(portY + portH) * s;
+        portX = (int32_t)floorf(x0 + 0.5f);
+        portY = (int32_t)floorf(y0 + 0.5f);
+        portW = (int32_t)floorf(x1 + 0.5f) - portX;
+        portH = (int32_t)floorf(y1 + 0.5f) - portY;
+    }
     float viewXf = (float)viewX;
     float viewYf = (float)viewY;
+    float viewWf = (float)viewW;
+    float viewHf = (float)viewH;
+    // The GPU viewport can't start left of or above a surface (a negative origin wraps to a huge
+    // unsigned value and nothing draws). The layer's ports often spill past its edges (a scene wider
+    // than the top screen), so clip the port to the surface and shrink the view by the same share.
+    if (renderer->passActive && viewAngle == 0.0f && portW > 0 && portH > 0 &&
+        renderer->layerSurfaceId >= 0 && renderer->currentTargetSurfaceId == renderer->layerSurfaceId) {
+        const N3DSSurface* layerSurface = &renderer->surfaces[renderer->layerSurfaceId];
+        int32_t maxW = layerSurface->width, maxH = layerSurface->height;
+        float perPxX = viewWf / (float)portW, perPxY = viewHf / (float)portH;
+        int32_t cx0 = portX < 0 ? 0 : portX, cy0 = portY < 0 ? 0 : portY;
+        int32_t cx1 = portX + portW > maxW ? maxW : portX + portW;
+        int32_t cy1 = portY + portH > maxH ? maxH : portY + portH;
+        if (cx1 > cx0 && cy1 > cy0) {
+            viewXf += (float)(cx0 - portX) * perPxX;
+            viewYf += (float)(cy0 - portY) * perPxY;
+            viewWf = (float)(cx1 - cx0) * perPxX;
+            viewHf = (float)(cy1 - cy0) * perPxY;
+            portX = cx0;
+            portY = cy0;
+            portW = cx1 - cx0;
+            portH = cy1 - cy0;
+        }
+    }
     renderer->currentViewX = viewX;
     renderer->currentViewY = viewY;
     renderer->currentViewW = viewW;
@@ -5601,7 +5677,7 @@ static void C3D_beginView(Renderer* base, int32_t viewX, int32_t viewY, int32_t 
     renderer->currentViewAngle = viewAngle;
     renderer->viewCullActive = true;
     renderer->customCameraTransformActive = false;
-    C3D_setViewProjection(base, viewXf, viewYf, (float)viewW, (float)viewH, viewAngle);
+    C3D_setViewProjection(base, viewXf, viewYf, viewWf, viewHf, viewAngle);
     if (renderer->currentTargetSurfaceId >= 0 &&
         (uint32_t)renderer->currentTargetSurfaceId < renderer->surfaceCount &&
         renderer->surfaces[renderer->currentTargetSurfaceId].target != NULL) {
@@ -5626,7 +5702,7 @@ static void C3D_beginView(Renderer* base, int32_t viewX, int32_t viewY, int32_t 
         renderer->screenTransformActive = false;
         C3D_Mtx proj;
         C3D_makeSurfaceProjection(
-            &proj, viewXf, viewYf, (float)viewW, (float)viewH, viewAngle);
+            &proj, viewXf, viewYf, viewWf, viewHf, viewAngle);
         n3ds_c3dSetProjectionC3D(&renderer->drawContext, &proj);
         return;
     }
@@ -5956,6 +6032,7 @@ Renderer* C3D_create(
     renderer->currentTargetSurfaceId = INT32_MIN;
     renderer->applicationSurfaceId = -1;
     renderer->bottomSurfaceId = -1;
+    renderer->layerSurfaceId = -1;
     renderer->hostCaptureSurfaceId = -1;
     renderer->activeRoomIndex = -1;
     renderer->viewCullActive = false;
@@ -6115,6 +6192,10 @@ void C3D_skipTopScreenPresent(Renderer* renderer) {
     n3ds_c3dFlush(&n3ds->drawContext);
     C3D_RenderTargetDetachOutput(n3ds->topTarget);
     n3ds->topTarget->used = false;
+    if (n3ds->stereoOn && n3ds->rightTarget != NULL) {
+        C3D_RenderTargetDetachOutput(n3ds->rightTarget);
+        n3ds->rightTarget->used = false;
+    }
 }
 
 void C3D_restoreTopScreenOutput(Renderer* renderer) {
@@ -6122,6 +6203,8 @@ void C3D_restoreTopScreenOutput(Renderer* renderer) {
     N3DSRenderer* n3ds = (N3DSRenderer*)renderer;
     if (n3ds->topTarget == NULL) return;
     C3D_RenderTargetSetOutput(n3ds->topTarget, GFX_TOP, GFX_LEFT, N3DS_TRANSFER_FLAGS);
+    if (n3ds->stereoOn && n3ds->rightTarget != NULL)
+        C3D_RenderTargetSetOutput(n3ds->rightTarget, GFX_TOP, GFX_RIGHT, N3DS_TRANSFER_FLAGS);
 }
 
 bool C3D_bottomScreenUsed(MAYBE_UNUSED Renderer* renderer) {
@@ -6183,4 +6266,191 @@ uint32_t C3D_getAtlasSizeBuckets(
     }
 
     return bucketCount;
+}
+
+// ===[ DoodleBob: two-screen passes and stereo 3D ]===
+
+static int32_t C3D_dbScreenW(int screen) {
+    return screen == C3D_DB_SCREEN_BOTTOM ? N3DS_BOTTOM_WIDTH : N3DS_TOP_WIDTH;
+}
+
+static bool C3D_dbLayerLive(N3DSRenderer* renderer) {
+    return renderer->layerSurfaceId >= 0 &&
+        (uint32_t)renderer->layerSurfaceId < renderer->surfaceCount &&
+        renderer->surfaces[renderer->layerSurfaceId].used &&
+        renderer->surfaces[renderer->layerSurfaceId].target != NULL;
+}
+
+void C3D_dbBeginPass(Renderer* base, int screen, float scale, float offX, float offY) {
+    assert(base != NULL);
+    N3DSRenderer* renderer = (N3DSRenderer*)base;
+    n3ds_c3dFlush(&renderer->drawContext);
+    if (screen == C3D_DB_SCREEN_TOP_RIGHT && (!renderer->stereoOn || renderer->rightTarget == NULL))
+        screen = C3D_DB_SCREEN_TOP;
+    if (screen == C3D_DB_SCREEN_LAYER && !C3D_dbLayerLive(renderer)) screen = C3D_DB_SCREEN_TOP;
+    if (screen == C3D_DB_SCREEN_BOTTOM && renderer->bottomTarget == NULL) screen = C3D_DB_SCREEN_TOP;
+    renderer->passActive = true;
+    renderer->passScreen = (uint8_t)screen;
+    renderer->passScale = scale > 0.0f ? scale : 1.0f;
+    renderer->passOffX = offX;
+    renderer->passOffY = offY;
+    if (screen == C3D_DB_SCREEN_BOTTOM) renderer->bottomScreenUsedThisFrame = true;
+    C3D_bindTarget(renderer, RENDER_TARGET_HOST_FRAMEBUFFER, screen == C3D_DB_SCREEN_BOTTOM);
+    renderer->screenTransformActive = false;
+    renderer->customCameraTransformActive = false;
+    renderer->viewCullActive = false;
+    int32_t w = C3D_dbScreenW(screen);
+    int32_t h = N3DS_TOP_HEIGHT;
+    if (screen == C3D_DB_SCREEN_LAYER) {
+        n3ds_c3dSetSurfaceProj(&renderer->drawContext, (float)w, (float)h);
+    } else {
+        C3D_updateHostProjection(renderer);
+    }
+    renderer->currentLogicalPortX = 0;
+    renderer->currentLogicalPortY = 0;
+    renderer->currentLogicalPortW = w;
+    renderer->currentLogicalPortH = h;
+    renderer->base.CPortX = 0;
+    renderer->base.CPortY = 0;
+    renderer->base.CPortW = w;
+    renderer->base.CPortH = h;
+}
+
+void C3D_dbEndPasses(Renderer* base) {
+    assert(base != NULL);
+    N3DSRenderer* renderer = (N3DSRenderer*)base;
+    n3ds_c3dFlush(&renderer->drawContext);
+    renderer->passActive = false;
+}
+
+bool C3D_dbPassIsBottom(Renderer* base) {
+    N3DSRenderer* renderer = (N3DSRenderer*)base;
+    return renderer->passActive && renderer->passScreen == C3D_DB_SCREEN_BOTTOM;
+}
+
+// Solid rectangle in screen pixels on the current pass's screen. color is 0xBBGGRR.
+void C3D_dbFillPassRect(Renderer* base, float x, float y, float w, float h, uint32_t color, float alpha) {
+    assert(base != NULL);
+    N3DSRenderer* renderer = (N3DSRenderer*)base;
+    if (!renderer->passActive) return;
+    float s = renderer->passScale, ox = renderer->passOffX, oy = renderer->passOffY;
+    renderer->passScale = 1.0f;
+    renderer->passOffX = 0.0f;
+    renderer->passOffY = 0.0f;
+    int32_t sw = C3D_dbScreenW(renderer->passScreen);
+    int32_t sh = N3DS_TOP_HEIGHT;
+    base->vtable->beginView(base, 0, 0, sw, sh, 0, 0, sw, sh, 0.0f);
+    N3DSRenderState saved = renderer->renderState;
+    renderer->renderState.blendEnabled = true;
+    renderer->renderState.blendSrc = bm_src_alpha;
+    renderer->renderState.blendDst = bm_inv_src_alpha;
+    renderer->renderState.blendSrcAlpha = bm_src_alpha;
+    renderer->renderState.blendDstAlpha = bm_inv_src_alpha;
+    renderer->renderState.blendEq = GPU_BLEND_ADD;
+    renderer->renderState.alphaTestEnabled = false;
+    renderer->renderState.colorWriteR = renderer->renderState.colorWriteG = true;
+    renderer->renderState.colorWriteB = renderer->renderState.colorWriteA = true;
+    C3D_applyBlendState(renderer);
+    base->vtable->drawRectangle(base, x, y, x + w, y + h, color, alpha, false);
+    base->vtable->endView(base);
+    C3D_restoreBlendState(renderer, &saved);
+    renderer->passScale = s;
+    renderer->passOffX = ox;
+    renderer->passOffY = oy;
+}
+
+// The offscreen top-screen layer (400x240 RGBA8). Made once; returns whether it exists.
+bool C3D_dbEnsureLayer(Renderer* base) {
+    assert(base != NULL);
+    N3DSRenderer* renderer = (N3DSRenderer*)base;
+    if (C3D_dbLayerLive(renderer)) return true;
+    renderer->layerSurfaceId = C3D_createSurfaceStorageEx(base, N3DS_TOP_WIDTH, N3DS_TOP_HEIGHT,
+        N3DS_TOP_WIDTH, N3DS_TOP_HEIGHT, true, GPU_RGBA8, true, true);
+    if (!C3D_dbLayerLive(renderer)) {
+        renderer->layerSurfaceId = -1;
+        return false;
+    }
+    C3D_setTextureFiltering(&renderer->surfaces[renderer->layerSurfaceId].tex, true);
+    return true;
+}
+
+bool C3D_dbLayerReady(Renderer* base) {
+    return C3D_dbLayerLive((N3DSRenderer*)base);
+}
+
+// Turns the top screen's stereo output on or off. Returns whether stereo is on afterwards.
+bool C3D_dbSetStereo(Renderer* base, bool on) {
+    assert(base != NULL);
+    N3DSRenderer* renderer = (N3DSRenderer*)base;
+    if (on) {
+        if (renderer->rightTarget == NULL) {
+            renderer->rightTarget = C3D_RenderTargetCreate(
+                N3DS_TOP_HEIGHT, N3DS_TOP_WIDTH, GPU_RB_RGBA8, -1);
+            if (renderer->rightTarget == NULL) on = false;
+        }
+        if (on && !C3D_dbEnsureLayer(base)) on = false;
+    }
+    if (on == renderer->stereoOn) return on;
+    if (on) {
+        gfxSet3D(true);
+        C3D_RenderTargetSetOutput(renderer->rightTarget, GFX_TOP, GFX_RIGHT, N3DS_TRANSFER_FLAGS);
+    } else {
+        if (renderer->rightTarget != NULL) C3D_RenderTargetDetachOutput(renderer->rightTarget);
+        gfxSet3D(false);
+    }
+    renderer->stereoOn = on;
+    return on;
+}
+
+// Starts drawing a top-screen layer offscreen. Transparent layers start see-through; otherwise the first
+// clear of the pass (the room's background colour) fills it.
+void C3D_dbBeginLayer(Renderer* base, bool transparent) {
+    assert(base != NULL);
+    N3DSRenderer* renderer = (N3DSRenderer*)base;
+    uint8_t bit = (uint8_t)(1u << C3D_DB_SCREEN_LAYER);
+    renderer->passClearedMask &= (uint8_t)~bit;
+    C3D_dbBeginPass(base, C3D_DB_SCREEN_LAYER, 1.0f, 0.0f, 0.0f);
+    if (renderer->passScreen != C3D_DB_SCREEN_LAYER) return;
+    if (transparent) {
+        C3D_safeFrameSplit(renderer);
+        C3D_RenderTargetClear(renderer->surfaces[renderer->layerSurfaceId].target, C3D_CLEAR_ALL,
+            n3ds_c3dClearColor(0, 0, 0, 0), 0);
+        renderer->passClearedMask |= bit;
+    }
+}
+
+// Draws the finished layer onto a screen at (x, y) with the given scale (screen px per layer px).
+// Opaque layers are drawn slightly enlarged so a sideways shift never uncovers a screen edge.
+void C3D_dbCompositeLayer(Renderer* base, int screen, float x, float y, float scale, bool opaque) {
+    assert(base != NULL);
+    N3DSRenderer* renderer = (N3DSRenderer*)base;
+    if (!C3D_dbLayerLive(renderer)) return;
+    int32_t layer = renderer->layerSurfaceId;
+    if (renderer->currentTargetSurfaceId == layer) {
+        C3D_safeFrameSplit(renderer);
+        C3D_markSurfaceReady(renderer, layer);
+    }
+    C3D_dbBeginPass(base, screen, 1.0f, 0.0f, 0.0f);
+    if (renderer->passScreen == C3D_DB_SCREEN_LAYER) return;
+    base->vtable->clearScreen(base, 0x000000u, 1.0f);
+    int32_t sw = C3D_dbScreenW(renderer->passScreen);
+    base->vtable->beginView(base, 0, 0, sw, N3DS_TOP_HEIGHT, 0, 0, sw, N3DS_TOP_HEIGHT, 0.0f);
+    N3DSRenderState saved = renderer->renderState;
+    if (opaque) {
+        C3D_beginSurfaceCopyState(renderer);
+        float pad = fabsf(x) + 1.0f;
+        float grow = ((float)N3DS_TOP_WIDTH * scale + pad * 2.0f) / ((float)N3DS_TOP_WIDTH * scale);
+        x = x - pad;
+        y = y - ((float)N3DS_TOP_HEIGHT * scale * (grow - 1.0f)) * 0.5f;
+        scale *= grow;
+    } else {
+        renderer->renderState.blendEnabled = false;
+        C3D_applyBlendState(renderer);
+        n3ds_c3dSetBlend(&renderer->drawContext, true, GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE,
+            GPU_ONE_MINUS_SRC_ALPHA, GPU_ONE, GPU_ONE_MINUS_SRC_ALPHA);
+    }
+    base->vtable->drawSurface(base, layer, 0, 0, N3DS_TOP_WIDTH, N3DS_TOP_HEIGHT, x, y, scale,
+        scale, 0.0f, 0xFFFFFFu, 1.0f);
+    base->vtable->endView(base);
+    C3D_restoreBlendState(renderer, &saved);
 }

@@ -7485,6 +7485,32 @@ static RValue builtin_array_shuffle(VMContext* ctx, RValue* args, int32_t argCou
 
 // ===[ COLLISION FUNCTIONS]===
 
+// DoodleBob 3DS: whether the caller (already moved to its test position, bbox given) overlaps any active instance,
+// solid ones only when solidOnly. Uses the spatial grid instead of scanning every instance: DoodleBob levels have
+// ~1,400 instances and call place_free dozens of times per step (move_contact_solid up to 1,000 times).
+static bool gridAnyOverlap(Runner* runner, Instance* caller, InstanceBBox callerBBox, bool solidOnly) {
+    if (!callerBBox.valid) return false;
+    SpatialGrid_syncGrid(runner, runner->spatialGrid);
+    SpatialGridQuery query = SpatialGrid_prepareQuery(runner, callerBBox.left, callerBBox.top, callerBBox.right, callerBBox.bottom, INSTANCE_ALL);
+    for (int32_t gx = query.range.minGridX; query.range.maxGridX >= gx; gx++) {
+        for (int32_t gy = query.range.minGridY; query.range.maxGridY >= gy; gy++) {
+            Instance** cell = runner->spatialGrid->grid[SpatialGrid_cellIndex(runner->spatialGrid, gx, gy)];
+            int32_t cellLen = (int32_t) arrlen(cell);
+            repeat(cellLen, ci) {
+                Instance* other = cell[ci];
+                if (!other->active || other == caller) continue;
+                if (solidOnly && !other->solid) continue;
+                if (other->lastCollisionQueryId == query.queryId) continue;
+                other->lastCollisionQueryId = query.queryId;
+                InstanceBBox otherBBox = Collision_computeBBox(runner, other);
+                if (!otherBBox.valid) continue;
+                if (Collision_instancesOverlapPrecise(runner, caller, other, callerBBox, otherBBox)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 static RValue builtin_place_free(VMContext* ctx, RValue* args, int32_t argCount) {
     REQUIRE_ARGC_AT_LEAST("place_free", 2, RValue_makeBool(true));
 
@@ -7502,23 +7528,7 @@ static RValue builtin_place_free(VMContext* ctx, RValue* args, int32_t argCount)
     caller->y = testY;
 
     InstanceBBox callerBBox = Collision_computeBBox(runner, caller);
-    bool free = true;
-
-    if (callerBBox.valid) {
-        int32_t instanceCount = (int32_t) arrlen(runner->instances);
-        repeat(instanceCount, i) {
-            Instance* other = runner->instances[i];
-            if (!other->active || !other->solid || other == caller) continue;
-
-            InstanceBBox otherBBox = Collision_computeBBox(runner, other);
-            if (!otherBBox.valid) continue;
-
-            if (Collision_instancesOverlapPrecise(runner, caller, other, callerBBox, otherBBox)) {
-                free = false;
-                break;
-            }
-        }
-    }
+    bool free = !gridAnyOverlap(runner, caller, callerBBox, true);
 
     // Restore original position
     caller->x = savedX;
@@ -7535,23 +7545,7 @@ static bool placeEmptyAt(Runner* runner, Instance* caller, GMLReal testX, GMLRea
     caller->y = testY;
 
     InstanceBBox callerBBox = Collision_computeBBox(runner, caller);
-    bool empty = true;
-
-    if (callerBBox.valid) {
-        int32_t instanceCount = (int32_t) arrlen(runner->instances);
-        repeat(instanceCount, i) {
-            Instance* other = runner->instances[i];
-            if (!other->active || other == caller) continue;
-
-            InstanceBBox otherBBox = Collision_computeBBox(runner, other);
-            if (!otherBBox.valid) continue;
-
-            if (Collision_instancesOverlapPrecise(runner, caller, other, callerBBox, otherBBox)) {
-                empty = false;
-                break;
-            }
-        }
-    }
+    bool empty = !gridAnyOverlap(runner, caller, callerBBox, false);
 
     caller->x = savedX;
     caller->y = savedY;
@@ -7566,23 +7560,7 @@ static bool placeFreeAt(Runner* runner, Instance* caller, GMLReal testX, GMLReal
     caller->y = testY;
 
     InstanceBBox callerBBox = Collision_computeBBox(runner, caller);
-    bool free = true;
-
-    if (callerBBox.valid) {
-        int32_t instanceCount = (int32_t) arrlen(runner->instances);
-        repeat(instanceCount, i) {
-            Instance* other = runner->instances[i];
-            if (!other->active || !other->solid || other == caller) continue;
-
-            InstanceBBox otherBBox = Collision_computeBBox(runner, other);
-            if (!otherBBox.valid) continue;
-
-            if (Collision_instancesOverlapPrecise(runner, caller, other, callerBBox, otherBBox)) {
-                free = false;
-                break;
-            }
-        }
-    }
+    bool free = !gridAnyOverlap(runner, caller, callerBBox, true);
 
     caller->x = savedX;
     caller->y = savedY;
@@ -10699,6 +10677,30 @@ static RValue builtin_move_contact_solid(VMContext* ctx, RValue* args, MAYBE_UNU
     GMLReal maxdist = RValue_toReal(args[1]);
     moveContactCommon(ctx->runner, ctx->currentCallFrame->self, dir, maxdist, false);
     return RValue_makeUndefined();
+}
+
+// DoodleBob 3DS: legacy move_contact(dir), no distance limit. Every ground object in DoodleBob is solid.
+static RValue builtin_move_contact(VMContext* ctx, RValue* args, int32_t argCount) {
+    REQUIRE_ARGC_AT_LEAST("move_contact", 1, RValue_makeUndefined());
+    if (ctx->currentCallFrame->self == nullptr) return RValue_makeUndefined();
+    moveContactCommon(ctx->runner, ctx->currentCallFrame->self, RValue_toReal(args[0]), -1.0, false);
+    return RValue_makeUndefined();
+}
+
+// DoodleBob 3DS: io_clear() forgets all held/pressed/released keys and mouse buttons.
+static RValue builtin_io_clear(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+    if (runner->keyboard != nullptr) {
+        for (int32_t key = 0; GML_KEY_COUNT > key; key++) RunnerKeyboard_clear(runner->keyboard, key);
+    }
+    if (runner->mouse != nullptr) RunnerMouse_clear(runner->mouse, GML_MB_ANY);
+    return RValue_makeUndefined();
+}
+
+// DoodleBob 3DS: virtual_key_add only runs in the game's Android mode, which stays off. Return a valid-looking id.
+static RValue builtin_virtual_key_add(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    static int32_t nextVirtualKeyId = 0;
+    return RValue_makeReal((GMLReal) nextVirtualKeyId++);
 }
 
 // move_contact_all shares the existing 2D collision/movement implementation.
@@ -24695,6 +24697,9 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "move_snap", builtin_move_snap);
     VM_registerBuiltin(ctx, "move_wrap", builtin_move_wrap);
     VM_registerBuiltin(ctx, "move_contact_solid", builtin_move_contact_solid);
+    VM_registerBuiltin(ctx, "move_contact", builtin_move_contact);
+    VM_registerBuiltin(ctx, "io_clear", builtin_io_clear);
+    VM_registerBuiltin(ctx, "virtual_key_add", builtin_virtual_key_add);
     VM_registerBuiltin(ctx, "move_contact_all", builtin_move_contact_all);
     VM_registerBuiltin(ctx, "move_outside_solid", builtin_move_outside_solid);
     VM_registerBuiltin(ctx, "move_outside_all", builtin_move_outside_all);

@@ -583,12 +583,17 @@ static bool n3ds_audioPlaybackFinished(const N3DSSoundInstance* inst, u64 nowTic
     return true;
 }
 
+// DoodleBob settings menu volumes: streamed sounds are the music tracks, everything else is an effect.
+static float g_dbMusicVolume = 1.0f;
+static float g_dbEffectsVolume = 1.0f;
+
 static void n3ds_audioApplyMix(N3DSAudioSystem* audio, N3DSSoundInstance* inst) {
     float mix[12];
     memset(mix, 0, sizeof(mix));
     inst->gain = Audio_sanitizeGain(inst->gain);
     float gain =
-        inst->gain * audio->masterGain * AudioSystem_soundGroupGain(&audio->base, inst->soundIndex);
+        inst->gain * audio->masterGain * AudioSystem_soundGroupGain(&audio->base, inst->soundIndex) *
+        (inst->isStream ? g_dbMusicVolume : g_dbEffectsVolume);
     if (inst->useNativeAdpcm && inst->secondaryChannelId >= 0) {
         mix[0] = gain;
         ndspChnSetMix(inst->channelId, mix);
@@ -1263,24 +1268,30 @@ static void n3ds_audioInit(AudioSystem* base, DataWin* dataWin, FileSystem* file
         ndspChnReset((int)i);
         ndspChnSetInterp((int)i, NDSP_INTERP_LINEAR);
     }
+    // Core 1 is not always available (some launchers and system setups refuse the time limit). The
+    // game must still start then: the worker runs on core 0 instead, just above the game thread's
+    // priority (it sleeps until a stream buffer needs filling). Only if no worker can run at all
+    // does music stay silent; the game never stops here.
     Result cpuLimitResult = APT_SetAppCpuTimeLimit(N3DS_STREAM_WORKER_CPU_LIMIT);
-    if (R_FAILED(cpuLimitResult)) {
-        audio->startupError =
-            "Failed to reserve core 1 for audio streaming. Press START.";
-        logEvent("audio_fail", "core 1 reservation failed rc=0x%08lx",
-            (unsigned long)cpuLimitResult);
-    } else {
+    if (R_SUCCEEDED(cpuLimitResult)) {
         audio->workerThread = threadCreate(n3ds_audioStreamWorkerMain, audio,
             N3DS_STREAM_WORKER_STACK_SIZE, N3DS_STREAM_WORKER_PRIORITY,
             N3DS_STREAM_WORKER_CORE_ID, false);
-        if (audio->workerThread == NULL) {
-            audio->startupError =
-                "Failed to start the core 1 audio worker. Press START.";
-            logEvent("audio_fail", "core 1 worker creation failed");
-        } else {
-            audio->workerEnabled = true;
-        }
+        if (audio->workerThread == NULL)
+            logEvent("audio_fail", "core 1 worker creation failed; trying core 0");
+    } else {
+        logEvent("audio_fail", "core 1 reservation failed rc=0x%08lx; trying core 0",
+            (unsigned long)cpuLimitResult);
     }
+    if (audio->workerThread == NULL) {
+        s32 mainPriority = 0x30;
+        svcGetThreadPriority(&mainPriority, CUR_THREAD_HANDLE);
+        audio->workerThread = threadCreate(n3ds_audioStreamWorkerMain, audio,
+            N3DS_STREAM_WORKER_STACK_SIZE, mainPriority > 0x18 ? mainPriority - 1 : mainPriority, 0,
+            false);
+        if (audio->workerThread == NULL) logEvent("audio_fail", "core 0 worker creation failed");
+    }
+    audio->workerEnabled = audio->workerThread != NULL;
     logEvent("audio",
         "worker enabled=%d requestedCore=%d cpuLimit=%lu nativeAdpcm=%d",
         audio->workerEnabled ? 1 : 0, N3DS_STREAM_WORKER_CORE_ID,
@@ -2208,4 +2219,17 @@ bool n3ds_audioIsReady(const N3DSAudioSystem* audio) {
 
 const char* n3ds_audioGetStartupError(const N3DSAudioSystem* audio) {
     return audio != NULL ? audio->startupError : NULL;
+}
+
+// DoodleBob settings menu: music and effect volumes (0..1), applied to what plays now and later.
+void n3ds_audioSetVolumes(AudioSystem* base, float music, float effects) {
+    N3DSAudioSystem* audio = (N3DSAudioSystem*)base;
+    if (audio == NULL) return;
+    LightLock_Lock(&audio->lock);
+    g_dbMusicVolume = music < 0.0f ? 0.0f : (music > 1.0f ? 1.0f : music);
+    g_dbEffectsVolume = effects < 0.0f ? 0.0f : (effects > 1.0f ? 1.0f : effects);
+    repeat(N3DS_MAX_SOUND_INSTANCES, i) {
+        if (audio->instances[i].active) n3ds_audioApplyMix(audio, &audio->instances[i]);
+    }
+    LightLock_Unlock(&audio->lock);
 }

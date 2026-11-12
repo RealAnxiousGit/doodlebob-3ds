@@ -41,3 +41,18 @@ uint32_t C3D_getAtlasPageLimit(Renderer* renderer);
 uint32_t C3D_getAtlasSizeBuckets(
     Renderer* renderer, N3DSRendererAtlasSizeBucket* outBuckets, uint32_t maxBuckets);
 void C3D_syncRoom(Renderer* renderer, int32_t roomIndex);
+
+// DoodleBob: two-screen draw passes (game-window px -> screen px: screen = game * scale + offset) and stereo 3D.
+#define C3D_DB_SCREEN_TOP 0
+#define C3D_DB_SCREEN_BOTTOM 1
+#define C3D_DB_SCREEN_TOP_RIGHT 2
+#define C3D_DB_SCREEN_LAYER 3
+void C3D_dbBeginPass(Renderer* renderer, int screen, float scale, float offX, float offY);
+void C3D_dbEndPasses(Renderer* renderer);
+bool C3D_dbPassIsBottom(Renderer* renderer);
+void C3D_dbFillPassRect(Renderer* renderer, float x, float y, float w, float h, uint32_t color, float alpha);
+bool C3D_dbSetStereo(Renderer* renderer, bool on);
+void C3D_dbBeginLayer(Renderer* renderer, bool transparent);
+void C3D_dbCompositeLayer(Renderer* renderer, int screen, float x, float y, float scale, bool opaque);
+bool C3D_dbEnsureLayer(Renderer* renderer);
+bool C3D_dbLayerReady(Renderer* renderer);

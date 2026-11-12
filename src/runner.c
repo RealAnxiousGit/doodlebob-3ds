@@ -601,7 +601,7 @@ static void renderBackgroundElement(Runner* runner, RuntimeBackgroundElement* bg
 
 // Legacy GameMaker: Studio 1.x backgrounds
 static void drawGMS1Backgrounds(Runner* runner, bool foreground) {
-    if (runner->renderer == nullptr) return;
+    if (runner->renderer == nullptr || runner->drawPassNoBackgrounds) return;
     DataWin* dataWin = runner->dataWin;
     float roomW = (float) runner->currentRoom->width;
     float roomH = (float) runner->currentRoom->height;
@@ -719,6 +719,7 @@ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawabl
         Instance* inst = d->instance;
         if (!inst->active || !inst->visible)
             continue;
+        if (!Runner_drawPassAllows(runner, inst)) continue;
         if (d->layerOrder != 0) {
             RuntimeLayer* layer = Runner_findRuntimeLayerById(runner, inst->layer);
             if (layer == nullptr || !layer->visible) continue;
@@ -1012,7 +1013,7 @@ void Runner_draw(Runner* runner) {
         lastProcessedDrawKey = drawableKey(d);
 
         if (d->type == DRAWABLE_TILE) {
-            if (runner->renderer != nullptr) {
+            if (runner->renderer != nullptr && !runner->drawPassNoTiles) {
                 RoomTile* tile = &room->tiles[d->tileIndex];
                 // Skip tiles whose layer was hidden via tile_layer_hide(). Filtered here (not in the cache) so toggling layer visibility doesn't invalidate.
                 ptrdiff_t layerIdx = hmgeti(runner->tileLayerMap, tile->tileDepth);
@@ -1056,6 +1057,7 @@ void Runner_draw(Runner* runner) {
             if (d->layerOrder != 0) continue;
             // Filter inactive/invisible instances at draw time so the cache doesn't need invalidation when those flags toggle.
             if (!inst->active || !inst->visible || inst->sequenceControlled) continue;
+            if (!Runner_drawPassAllows(runner, inst)) continue;
 
             int32_t previousShader = Runner_pushLayerShader(runner, inst->layer);
             Runner_drawInstance(runner, inst);

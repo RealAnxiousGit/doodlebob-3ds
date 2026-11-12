@@ -11,3 +11,10 @@ compat/config.mk
 src/android/frontend/.gradle/
 src/android/frontend/app/.cxx/
 src/android/frontend/local.properties
+# DoodleBob port: never commit game data, decompiled code or converted assets
+data.win
+*.win
+game-data/
+analysis/dump/
+resources/3ds/romfs/gfx/
+resources/3ds/romfs/audio/

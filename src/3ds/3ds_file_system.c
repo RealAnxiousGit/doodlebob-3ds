@@ -236,12 +236,38 @@ static char* n3ds_fsResolvePath(FileSystem* fs, const char* relativePath) {
     return gamePath;
 }
 
+// Games often call file_exists every step (DoodleBob's title menu checks for its save each frame).
+// An SD stat costs milliseconds, so results are reused for a short time and dropped on any write or delete.
+typedef struct N3DSFileExistsCacheEntry {
+    char* key;
+    bool exists;
+    u64 tick;
+} N3DSFileExistsCacheEntry;
+static N3DSFileExistsCacheEntry* gN3DSFileExistsCache = NULL;
+#define N3DS_FILE_EXISTS_CACHE_TICKS (SYSCLOCK_ARM11 / 2u)
+
+static void n3ds_fsClearExistsCache(void) {
+    if (gN3DSFileExistsCache != NULL) shfree(gN3DSFileExistsCache);
+    gN3DSFileExistsCache = NULL;
+}
+
 static bool n3ds_fsFileExists(FileSystem* fs, const char* relativePath) {
+    u64 now = svcGetSystemTick();
+    if (relativePath != NULL && gN3DSFileExistsCache != NULL) {
+        ptrdiff_t idx = shgeti(gN3DSFileExistsCache, relativePath);
+        if (idx >= 0 && now - gN3DSFileExistsCache[idx].tick < N3DS_FILE_EXISTS_CACHE_TICKS)
+            return gN3DSFileExistsCache[idx].exists;
+    }
     char* path = n3ds_fsResolvePath(fs, relativePath);
     struct stat st;
     bool ok = path != NULL && stat(path, &st) == 0 && S_ISREG(st.st_mode);
 
     free(path);
+    if (relativePath != NULL) {
+        if (gN3DSFileExistsCache == NULL) sh_new_strdup(gN3DSFileExistsCache);
+        N3DSFileExistsCacheEntry entry = {.key = (char*)relativePath, .exists = ok, .tick = now};
+        shputs(gN3DSFileExistsCache, entry);
+    }
     return ok;
 }
 
@@ -293,6 +319,7 @@ static char* n3ds_fsReadFileText(FileSystem* fs, const char* relativePath) {
 
 static bool n3ds_fsWriteFileText(
     FileSystem* fs, const char* relativePath, const char* contents) {
+    n3ds_fsClearExistsCache();
     if (contents == NULL) return false;
 
     N3DSFileSystem* n3ds = (N3DSFileSystem*)fs;
@@ -318,6 +345,7 @@ static bool n3ds_fsWriteFileText(
 }
 
 static bool n3ds_fsDeleteFile(FileSystem* fs, const char* relativePath) {
+    n3ds_fsClearExistsCache();
     N3DSFileSystem* n3ds = (N3DSFileSystem*)fs;
     char* path = n3ds_fsJoin(n3ds->saveBasePath, relativePath);
     if (path == NULL) return false;
@@ -333,6 +361,7 @@ static bool n3ds_fsDeleteFile(FileSystem* fs, const char* relativePath) {
 }
 
 static bool n3ds_fsCreateDirectory(FileSystem* fs, const char* relativePath) {
+    n3ds_fsClearExistsCache();
     N3DSFileSystem* n3ds = (N3DSFileSystem*)fs;
     char* path = n3ds_fsJoin(n3ds->saveBasePath, relativePath);
     if (path == NULL) return false;
@@ -342,6 +371,7 @@ static bool n3ds_fsCreateDirectory(FileSystem* fs, const char* relativePath) {
 }
 
 static bool n3ds_fsDeleteDirectory(FileSystem* fs, const char* relativePath) {
+    n3ds_fsClearExistsCache();
     N3DSFileSystem* n3ds = (N3DSFileSystem*)fs;
     char* path = n3ds_fsJoin(n3ds->saveBasePath, relativePath);
     if (path == NULL) return false;
@@ -434,6 +464,7 @@ static bool n3ds_fsReadFileBinary(
 
 static bool n3ds_fsWriteFileBinary(
     FileSystem* fs, const char* relativePath, const uint8_t* data, int32_t size) {
+    n3ds_fsClearExistsCache();
     if (data == NULL || size < 0) return false;
 
     N3DSFileSystem* n3ds = (N3DSFileSystem*)fs;
@@ -464,6 +495,7 @@ static const char* n3ds_fsBinaryModeString(int32_t mode) {
 }
 
 static void* n3ds_fsBinaryOpen(FileSystem* fs, const char* relativePath, int32_t mode) {
+    n3ds_fsClearExistsCache();
     N3DSFileSystem* n3ds = (N3DSFileSystem*)fs;
     char* path = n3ds_fsJoin(n3ds->saveBasePath, relativePath);
     if (path == NULL) return NULL;

@@ -116,6 +116,7 @@ AccessControlInfo:
 
   ServiceAccessControl:
    - APT:U
+   - cfg:u
 
    - dsp::DSP
 

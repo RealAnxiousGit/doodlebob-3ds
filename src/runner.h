@@ -726,6 +726,13 @@ struct Runner {
     uint32_t nextInstanceId;
     RunnerKeyboardState* keyboard;
     RunnerMouseState* mouse;
+    // DoodleBob 3DS two-screen layouts: which instances (and whether backgrounds/tiles) the current draw pass
+    // includes. Zeroed = draw everything, so platforms that never set it are unaffected.
+    uint8_t drawPassMode; // RUNNER_DRAW_PASS_*
+    bool drawPassNoBackgrounds;
+    bool drawPassNoTiles;
+    int32_t drawPassObjects[48];
+    int32_t drawPassObjectCount;
     RuntimeView views[MAX_VIEWS];
     GMLCamera defaultCameras[MAX_DEFAULT_ROOM_CAMERAS];
     GMLCamera userCameras[MAX_USER_CAMERAS];
@@ -936,6 +943,18 @@ void Runner_setPaused(Runner* runner, bool paused);
 bool Runner_isPaused(Runner* runner);
 void Runner_initFirstRoom(Runner* runner);
 void Runner_step(Runner* runner);
+
+#define RUNNER_DRAW_PASS_ALL 0
+#define RUNNER_DRAW_PASS_EXCLUDE 1
+#define RUNNER_DRAW_PASS_ONLY 2
+static inline bool Runner_drawPassAllows(const Runner* runner, const Instance* inst) {
+    if (runner->drawPassMode == RUNNER_DRAW_PASS_ALL) return true;
+    bool listed = false;
+    for (int32_t i = 0; i < runner->drawPassObjectCount; i++) {
+        if (runner->drawPassObjects[i] == inst->objectIndex) { listed = true; break; }
+    }
+    return runner->drawPassMode == RUNNER_DRAW_PASS_ONLY ? listed : !listed;
+}
 void Runner_handlePendingRoomChange(Runner* runner);
 void Runner_executeEvent(Runner* runner, Instance* instance, int32_t eventType, int32_t eventSubtype);
 void Runner_executeEventFromObject(Runner* runner, Instance* instance, Instance* other, int32_t startObjectIndex, int32_t eventType, int32_t eventSubtype);

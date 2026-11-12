@@ -1,151 +1,96 @@
-<h1 align="center">Cinnamon</h1>
+<h1 align="center">DoodleBob 3DS</h1>
 
-
-</p>
 <p align="center">
-    <a href="https://discord.gg/undertale3ds"><img src="https://img.shields.io/discord/1406856655920168971?color=5865F2&logo=discord&logoColor=white&label=discord"></a>
+A Nintendo 3DS port of <b>DoodleBob and the Magic Pencil DX: Doodler's Cut</b>, the fan game by Ethan Wake,<br>
+running on <a href="https://github.com/Project-Sunshine-Native/cinnamon-runner">cinnamon-runner</a>, an open-source GameMaker runner for 3DS.
 </p>
 
 ---
-Cinnamon is a **fully human made** fork of the Butterscotch GameMaker runner specifically targeting the Nintendo 3DS, Wii, and Wii U
 
-The 3DS, Wii, and Wii U backends were built by humans and humans only. No AI tools were used for development!
+> [!IMPORTANT]
+> **This repo contains no game files.** You need your own copy of the game. The converter turns it into a 3DS version on your PC.
+> This is an unofficial fan project. It isn't affiliated with Ethan Wake, Nickelodeon or Nintendo.
 
-## Game Compatibility
+## What you get
 
-Cinnamon's goal is to be able to have most GameMaker games fully playable. 
+- The full game on 3DS, with drawing on the touch screen using the stylus.
+- Menus you can use with the stylus or with the D-pad and A.
+- The game's HUD on the top screen and the drawing area on the bottom screen.
+- Stereoscopic 3D on the top screen: the backdrop sits deep, the scene in the middle and the HUD in front.
+- A **Settings** menu (from the title screen and the pause menu) with:
+  - Music and sound volume
+  - Drawing sensitivity (Normal / High / Max), for smoother ink lines
+  - Camera zoom (Close / Medium / Far)
+  - 3D Depth (Off / Low / Medium / High). On a 2DS or New 2DS XL it's greyed out, as they have no 3D screen.
+  - Smooth scrolling, with the D-pad or by dragging with the stylus
+- A Home Menu icon and banner, made from the game's own art.
+- Saves and settings stored on the SD card in `sd:/3ds/DoodleBob/`.
 
-Of course, there are hardware limitations. These are consoles that are more than a decade old and while Cinnamon is heavily optimized, games with heavy 3D or heavy particle systems may run poorly or not run at all.
+## How to install
 
-Here are the Bytecode Versions that Cinnamon currently supports
+You need a 3DS with custom firmware (for example Luma3DS) and a Windows PC.
 
-- WAD Version 8 (GameMaker: Studio 1.0.198+)
-- WAD Version 9 (GameMaker: Studio 1.0.527+)
-- WAD Version 10 (GameMaker: Studio 1.1.609+)
-- WAD Version 11 (GameMaker: Studio 1.1.754+)
-- WAD Version 12 (GameMaker: Studio 1.1.867+)
-- WAD Version 13 (GameMaker: Studio 1.1.917+)
-- WAD Version 14 (GameMaker: Studio 1.4.1464+)
-- WAD Version 15 (GameMaker: Studio 1.4.1675+)
-- WAD Version 16 (GameMaker: Studio 1.4.1767+)
-- WAD Version 17 (GameMaker: Studio 2.2+)
+1. Download **`DoodleBob 3DS Converter.exe`** from the [Releases](../../releases) page.
+2. Run it. Windows may show **"Windows protected your PC"** because the program isn't signed. Click **More info → Run anyway**.
+3. Click **Choose...** and pick the game's `.exe` as you downloaded it, or `data.win` from the game folder.
+4. Click **Convert**. It takes about a minute. When it's done, click **Open folder**.
+5. Copy the `3ds` folder from `SD card` onto the root of your SD card.
+6. Install **`DoodleBob.cia`** with FBI (or another CIA installer), or launch **`DoodleBob.3dsx`** from the Homebrew Launcher.
 
+Updating from v0.3? Copy the new `3ds` folder over the old one (your save and settings are kept) and install the new CIA. v0.3's music files (`msc_*.bcwav`) aren't used any more and can be deleted.
 
-Of course, there are exceptions that break game compatibility altogether:
+The converter checks that your copy is the right version of the game before it converts anything. The output folder also has a `How to install.txt` with the same steps.
 
-* Games compiled with YYC, because they use native code instead of bytecode. 
-* Games compiled with the new [GMRT](https://github.com/YoYoGames/GMRT-Beta/tree/main), because they use native code instead of bytecode.
-  
-This includes games like Forager, Hyperlight Drifter, and more. 
+### Controls
 
-## Supported Platforms
-* Nintendo 3DS
-* Nintendo Wii U
-* Nintendo Wii
-* ...and maybe more Nintendo consoles in the future!
+| Input | Action |
+| --- | --- |
+| Stylus | Draw, and tap menu buttons |
+| L or R + stylus | Erase |
+| Circle Pad / D-pad | Move, and pick menu buttons |
+| A | Jump / press the picked button |
+| B or X | Skip or advance text |
+| START | Pause |
+| SELECT | Back |
 
-Cinnamon was made for Project Sunshine's ports.
+## How it works
 
-## Project Sunshine
-* Project Sunshine is a project that aims to use Cinnamon to port a variety of games (such as UNDERTALE, DELTARUNE, and maybe more games in the future) to the Wii U, 3DS, Wii, GameCube, and maybe more consoles in the future! You can get beta builds on our [Discord](https://discord.gg/undertale3ds) aswell as news on the ports.
-### UNDERTALE: Wii U Edition
-* A released, full port of UNDERTALE on the Wii U. You can download this port on our releases page or on our Discord.
-### DELTARUNE: Wii U Edition
-* A full port of DELTARUNE Chapters 1-5 to the Wii U. Still currently in development.
-### UNDERTALE: 3DS Edition
-* A full port of UNDERTALE to the 3DS with 3DS exclusive features such as 3D and bottom screen features.
-### DELTARUNE: 3DS Edition
-* A full port of DELTARUNE Chapters 1-5 to the old and new 3DS.
-### UNDERTALE: Wii Edition
-* A full port of UNDERTALE to the Wii.
-### DELTARUNE Wii Edition
-* A full port of DELTARUNE to the Wii.
-### UNDERTALE: GameCube Edition
-* A full port of UNDERTALE to the GameCube.
-### DELTARUNE GameCube Edition
-* A full port of DELTARUNE Chapter 1 to the GameCube.
+The converter is a single Windows program. It never downloads anything and it never sends anything anywhere. When you click Convert, it:
 
-## Building
-Before proceeding, ensure you have a proper devkitpro environment set up for your platform
+1. Finds `data.win` inside the game's installer.
+2. Checks it against the SHA-256 of the supported version.
+3. Redraws a few menu images for the 3DS (the "Settings" button, the "Press B" prompt, the icon and banner) from the game's own art.
+4. Runs [cinnamon-preprocessor](https://github.com/Project-Sunshine-Native/cinnamon-preprocessor), which packs the textures into a 3DS atlas and converts the audio.
+5. Builds the `.3dsx` and `.cia` around the prebuilt 3DS runner it carries.
 
-### Building For 3DS
+## Building from source
 
-Install the SDK and audio libraries:
+- **3DS runner:** devkitPro (devkitARM, libctru, citro2d/citro3d). `cmake --preset 3ds`, then `cmake --build --preset 3ds`; the output is in `build/3dsx/`. The DoodleBob parts are the `src/3ds/db_*.c` files plus small hooks in `src/3ds/main.c` and `src/3ds/3ds_renderer.c`.
+- **Converter:** Python 3 with Pillow and PyInstaller. `doodlebob/converter/build/` has the scripts:
+  - `build-preprocess-win.sh` cross-compiles [cinnamon-preprocessor](https://github.com/Project-Sunshine-Native/cinnamon-preprocessor) for Windows with MinGW (set `PREPROCESSOR_DIR` to its checkout).
+  - `prepare-bin.py` gathers the runner, preprocessor, makerom and bannertool.
+  - `build-exe.ps1` packs everything into one exe.
 
-```bash
-sudo dkp-pacman -Syu --needed 3ds-dev 3ds-libvorbisidec 3ds-libogg 
-```
-then build:
+`doodlebob/NOTES.md` is the full development log.
 
-```bash
-cmake --preset 3ds
-cmake --build --preset 3ds
-```
+## Credits
 
-Outputs:
+- **Ethan Wake**: DoodleBob and the Magic Pencil DX: Doodler's Cut.
+- **[cinnamon-runner](https://github.com/Project-Sunshine-Native/cinnamon-runner)** and **[cinnamon-preprocessor](https://github.com/Project-Sunshine-Native/cinnamon-preprocessor)** by Project Sunshine Native, built on **[Butterscotch](https://github.com/MrPowerGamerBR/Butterscotch)** by MrPowerGamerBR.
+- **[makerom](https://github.com/3DSGuy/Project_CTR)** (MIT) and **[bannertool](https://github.com/carstene1ns/3ds-bannertool)** (MIT), bundled in the converter.
+- SpongeBob SquarePants and DoodleBob belong to Nickelodeon / Paramount.
 
-- `build/3dsx/cinnamon.3dsx`: executable for the Homebrew Launcher.
-- `build/3dsx/cinnamon.cia`: installable CIA for launching from the home screen.
+## License
 
-This builds the standard Release configuration with games loaded from the SD
-card. For installing games, see [the preprocessor](https://github.com/Project-Sunshine-Native/cinnamon-preprocessor)
+AGPL-3.0, the same as cinnamon-runner. See [LICENSE](LICENSE). The bundled tools keep their own licenses; the converter ships them in its `licenses` folder.
 
-### Building for Wii
+---
 
-Install the SDK and audio libraries:
+<details>
+<summary>About cinnamon-runner (the runner this port is built on)</summary>
 
-```bash
-sudo dkp-pacman -Syu --needed wii-dev ppc-libvorbisidec ppc-libogg
-```
-then build:
+cinnamon-runner is an open-source reimplementation of the GameMaker: Studio runner for the 3DS and Wii U, forked from Butterscotch. GameMaker: Studio games export their code as bytecode, so a compatible runner can play them on other platforms. It supports bytecode versions 16 and 17. It may not work with every game, and games may have quirks that don't exist in the original runner.
 
-```bash
-cmake --preset wii
-cmake --build --preset wii
-```
+Upstream: <https://github.com/Project-Sunshine-Native/cinnamon-runner>
 
-Outputs:
-
-- `build/wii/boot.dol`: executable for the Homebrew Channel.
-- `build/wii/boot.elf`: ELF executable.
-- `build/wii/icon.png`: Homebrew Channel icon.
-- `build/wii/meta.xml`: Homebrew Channel metadata.
-
-Copy `boot.dol`, `icon.png`, and `meta.xml` into `/apps/cinnamon/` on the SD
-card, then launch Cinnamon from the Homebrew Channel. For installing games, see [the preprocessor](https://github.com/Project-Sunshine-Native/cinnamon-preprocessor)
-
-
-## Showcase
-
-### Wii U (Real Hardware)
-
-- **UNDERTALE (Bytecode 16)**
-<img width="160" height="120" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000057247.jpg" />
-<img width="160" height="120" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000057245.jpg" />
-<img width="160" height="120" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000057243.jpg" />
-
-- **SURVEY_PROGRAM (Bytecode 16)**
-<img width="160" height="200" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000045789.jpg" />
-<img width="160" height="200" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/db8de335d5067d628d3bae1c90a705a57db3dbf9/resources/readme/screenshots/1000057255.jpg" />
-
-### Wii U (Cemu/Emulator)
-
-- **SURVEY_PROGRAM (Bytecode 16)**
-<img width="160" height="200" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/fe76737aea9d6402a55eb0059444c5283f88dff1/resources/readme/screenshots/1000057249.jpg" />
-<img width="160" height="200" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/fe76737aea9d6402a55eb0059444c5283f88dff1/resources/readme/screenshots/1000057251.jpg" />
-
-- **Pizza Tower Demo (Demo 1, Sage 2019 Demo) (Bytecode 16)**
-<img width="160" height="200" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/fe76737aea9d6402a55eb0059444c5283f88dff1/resources/readme/screenshots/1000057253.png" />
-<img width="160" height="200" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/fe76737aea9d6402a55eb0059444c5283f88dff1/resources/readme/screenshots/1000057254.png" />
-
-### 3DS (Real Hardware)
-
-- **UNDERTALE (Bytecode 16)**
-<img width="160" height="300" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/d2b7229ec79a30dc5cabaad163a595741d37897a/resources/readme/screenshots/1000057263.jpg" />
-<img width="160" height="300" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/d2b7229ec79a30dc5cabaad163a595741d37897a/resources/readme/screenshots/1000057262.jpg" />
-<img width="160" height="300" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/d2b7229ec79a30dc5cabaad163a595741d37897a/resources/readme/screenshots/1000057257.jpg" />
-<img width="160" height="300" alt="Image" src="https://github.com/Project-Sunshine-Native/cinnamon/blob/d2b7229ec79a30dc5cabaad163a595741d37897a/resources/readme/screenshots/1000049179.jpg" />
-
-## Disclaimer
-
-Cinnamon has no association, endorsement, or any connection whatsoever with any of the software that it facilitates, and does not provide any of the software it can run by itself. In order to use Cinnamon, you will need to provide your own game files.
+</details>
